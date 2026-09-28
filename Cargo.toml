@@ -1,0 +1,24 @@
+[package]
+name = "grok-budget"
+version = "0.2.0"
+edition = "2024"
+description = "Native Grok Build allowance monitor and status line"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+

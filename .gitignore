@@ -1,0 +1,7 @@
+__pycache__/
+output/
+*.sqlite3*
+*.zip
+test-results/
+target/
+grok-budget/*.exe
