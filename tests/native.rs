@@ -410,3 +410,39 @@ fn html_script_injection_is_escaped() {
     assert!(!raw.contains("</script><script>alert(1)"));
     assert!(raw.contains("\\u003c/script>"));
 }
+#[test]
+fn statusline_emits_no_ansi_unless_color_requested() {
+    // Grok Build 的状态栏渲染器不能完整处理 ANSI 序列；默认输出必须是纯文本。
+    let tmp = TempDir::new().unwrap();
+    let exe = env!("CARGO_BIN_EXE_grok-budget");
+    let payload = b"{\"cost\":{\"total_cost_usd\":0.53},\"context_window\":{\"session_input_tokens\":100,\"session_output_tokens\":20},\"session_id\":\"x\"}";
+    let run = |extra: &[&str]| {
+        let mut child = std::process::Command::new(exe)
+            .args(["--statusline", "--offline", "--grok-home"])
+            .arg(tmp.path())
+            .args(extra)
+            .env("COLUMNS", "120")
+            .env_remove("NO_COLOR")
+            .env_remove("GROK_BUDGET_COLOR")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(payload)
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let plain = run(&[]);
+    assert!(plain.contains("会话 $0.53 · 120 Token"), "{plain}");
+    assert!(!plain.contains('\u{1b}'), "{plain:?}");
+    let colored = run(&["--color"]);
+    assert!(colored.contains("\x1b[36m$0.53"), "{colored:?}");
+    assert!(colored.contains("\x1b[35m120"), "{colored:?}");
+}
