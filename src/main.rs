@@ -36,15 +36,9 @@ struct Args {
     html: Option<PathBuf>,
     #[arg(long)]
     no_color: bool,
-    #[arg(long)]
-    color: bool,
 }
-// Grok Build 的状态栏渲染器会截断部分 ANSI 序列（把 \x1b[35m 显示成 "35m" 残字），
-// 所以彩色默认关闭；直接在终端调试时可用 --color 或 GROK_BUDGET_COLOR=1 打开。
 fn color_enabled(args: &Args) -> bool {
-    (args.color || env::var_os("GROK_BUDGET_COLOR").is_some())
-        && !args.no_color
-        && env::var_os("NO_COLOR").is_none()
+    !args.no_color && env::var_os("NO_COLOR").is_none()
 }
 fn run(args: &Args) -> Result<()> {
     if args.watch.is_some_and(|v| v < 60) {

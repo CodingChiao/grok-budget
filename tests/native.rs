@@ -366,6 +366,30 @@ fn session_remains_when_account_quota_unavailable() {
     assert!(line.contains("暂不可用"));
 }
 #[test]
+fn zero_value_spans_color_cleanly() {
+    // 单字符 "0" 会先命中 \x1b[0m 里的 0；着色必须按位置单次扫描，不能事后替换。
+    let session = Session {
+        cost: None,
+        tokens: Some(0.0),
+        partial: false,
+    };
+    let line = status_text(None, &session, 80, true);
+    assert_eq!(
+        line.lines().next().unwrap(),
+        "会话 \x1b[36m$--\x1b[0m · \x1b[35m0\x1b[0m Token"
+    );
+    let session = Session {
+        cost: Some(0.53),
+        tokens: Some(10_450_000.0),
+        partial: false,
+    };
+    let line = status_text(None, &session, 80, true);
+    assert_eq!(
+        line.lines().next().unwrap(),
+        "会话 \x1b[36m$0.53\x1b[0m · \x1b[35m10.45M\x1b[0m Token"
+    );
+}
+#[test]
 fn layout_never_dims_stretches_or_drops_session_money() {
     let mut r = snapshot(4.0, 1.54, at());
     r["estimate"] = json!({"available":true,"usd":51.19});
@@ -380,6 +404,7 @@ fn layout_never_dims_stretches_or_drops_session_money() {
         assert!(line.contains("\x1b[36m$0.85\x1b[0m"));
         assert!(line.contains("\x1b[35m3.72M\x1b[0m"));
         let plain = strip_ansi(&line);
+        assert_eq!(plain, status_text(Some(&r), &session, w, false));
         assert!(plain.contains("4%"));
         assert!(plain.contains("已用 $1.54 · 12K Token"));
         assert!(!line.contains('|'));
@@ -411,23 +436,22 @@ fn html_script_injection_is_escaped() {
     assert!(raw.contains("\\u003c/script>"));
 }
 #[test]
-fn statusline_emits_no_ansi_unless_color_requested() {
-    // Grok Build 的状态栏渲染器不能完整处理 ANSI 序列；默认输出必须是纯文本。
+fn statusline_colors_default_on_and_no_color_disables() {
     let tmp = TempDir::new().unwrap();
     let exe = env!("CARGO_BIN_EXE_grok-budget");
     let payload = b"{\"cost\":{\"total_cost_usd\":0.53},\"context_window\":{\"session_input_tokens\":100,\"session_output_tokens\":20},\"session_id\":\"x\"}";
-    let run = |extra: &[&str]| {
-        let mut child = std::process::Command::new(exe)
-            .args(["--statusline", "--offline", "--grok-home"])
+    let run = |no_color: bool| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["--statusline", "--offline", "--grok-home"])
             .arg(tmp.path())
-            .args(extra)
             .env("COLUMNS", "120")
             .env_remove("NO_COLOR")
-            .env_remove("GROK_BUDGET_COLOR")
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(std::process::Stdio::piped());
+        if no_color {
+            cmd.env("NO_COLOR", "1");
+        }
+        let mut child = cmd.spawn().unwrap();
         use std::io::Write;
         child
             .stdin
@@ -439,10 +463,11 @@ fn statusline_emits_no_ansi_unless_color_requested() {
         assert!(out.status.success());
         String::from_utf8(out.stdout).unwrap()
     };
-    let plain = run(&[]);
-    assert!(plain.contains("会话 $0.53 · 120 Token"), "{plain}");
-    assert!(!plain.contains('\u{1b}'), "{plain:?}");
-    let colored = run(&["--color"]);
+    let colored = run(false);
     assert!(colored.contains("\x1b[36m$0.53"), "{colored:?}");
     assert!(colored.contains("\x1b[35m120"), "{colored:?}");
+    let plain = run(true);
+    assert!(!plain.contains('\u{1b}'), "{plain:?}");
+    assert!(plain.contains("会话 $0.53 · 120 Token"), "{plain}");
+    assert_eq!(strip_ansi(&colored), plain);
 }

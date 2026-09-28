@@ -240,6 +240,8 @@ pub fn status_text(
         return output;
     }
     // 36 cyan for money, 35 magenta for token counts. Placeholder "--" stays plain.
+    // Coloring must scan each plain line left-to-right in one pass: post-hoc replace
+    // can hit digits inside escape codes already inserted (e.g. the "0" in \x1b[0m).
     let spans: [(&str, &str, u8); 6] = [
         ("会话", &session_money, 36),
         ("会话", &session_tokens, 35),
@@ -248,20 +250,36 @@ pub fn status_text(
         ("周限", &limit_money, 36),
         ("周限", &weekly_tokens, 35),
     ];
-    let mut painted = output
-        .lines()
-        .map(|line| {
-            let mut line = line.to_string();
-            for (label, span, code) in &spans {
-                let placeholder = *code == 35 && span.trim_start_matches('≈') == "--";
-                if !span.is_empty() && !placeholder && line.contains(label) {
-                    line = line.replacen(span, &format!("\x1b[{code}m{span}\x1b[0m"), 1);
-                }
-            }
-            line
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut painted = String::with_capacity(output.len() + 96);
+    for (n, line) in output.lines().enumerate() {
+        if n > 0 {
+            painted.push('\n');
+        }
+        let active: Vec<(&str, u8)> = spans
+            .iter()
+            .filter(|(label, span, code)| {
+                !span.is_empty()
+                    && !(*code == 35 && span.trim_start_matches('≈') == "--")
+                    && line.contains(label)
+            })
+            .map(|(_, span, code)| (*span, *code))
+            .collect();
+        let mut cursor = 0;
+        while let Some((pos, span, code)) = active
+            .iter()
+            .filter_map(|&(span, code)| {
+                line[cursor..]
+                    .find(span)
+                    .map(|rel| (cursor + rel, span, code))
+            })
+            .min_by_key(|&(pos, _, _)| pos)
+        {
+            painted.push_str(&line[cursor..pos]);
+            painted.push_str(&format!("\x1b[{code}m{span}\x1b[0m"));
+            cursor = pos + span.len();
+        }
+        painted.push_str(&line[cursor..]);
+    }
     if let Some(u) = used {
         let code = if u >= 95.0 { 31 } else if u >= 80.0 { 33 } else { 32 };
         let span = match (&bar, bar_in_spent) {

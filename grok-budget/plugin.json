@@ -1,6 +1,6 @@
 {
   "name": "grok-budget",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Native Rust status line, session cost and tokens, weekly allowance and local usage monitor.",
   "author": {"name": "Local tools"},
   "license": "MIT"
