@@ -8,6 +8,9 @@ pub struct Session {
     pub cost: Option<f64>,
     pub tokens: Option<f64>,
     pub partial: bool,
+    pub tokens_estimated: bool,
+    pub cost_estimated: bool,
+    pub generating: bool,
 }
 
 fn sum_fields(value: &Value, fields: &[&str]) -> Option<f64> {
@@ -35,10 +38,8 @@ pub fn session_usage(home: &Path, payload: &Value) -> Session {
             },
         ),
         partial: false,
+        ..Session::default()
     };
-    if session.cost.is_some() && session.tokens.is_some() {
-        return session;
-    }
     let id = s(&payload["session_id"]);
     if id.is_empty()
         || id.len() > 128
@@ -65,18 +66,28 @@ pub fn session_usage(home: &Path, payload: &Value) -> Session {
             continue;
         }
         let totals = &ledger["session"];
-        let fallback_cost = session.cost.is_none();
-        if fallback_cost {
-            session.cost = number(&totals["costUsdTicks"]).map(|v| v / TICKS);
+        let ledger_cost = number(&totals["costUsdTicks"]).map(|v| v / TICKS);
+        let ledger_tokens = number(&totals["totalTokens"])
+            .or_else(|| sum_fields(totals, &["inputTokens", "outputTokens"]));
+        // Timer runs reuse Grok's last payload. Re-read the matching ledger even
+        // when that payload is complete, and advance the paired totals together.
+        let ledger_newer = ledger_tokens.zip(session.tokens).is_some_and(|(l, p)| {
+            l > p || (l == p && ledger_cost.zip(session.cost).is_some_and(|(l, p)| l > p))
+        });
+        let fallback_cost = session.cost.is_none()
+            && !session
+                .tokens
+                .zip(ledger_tokens)
+                .is_some_and(|(p, l)| p > l);
+        if fallback_cost || ledger_newer {
+            session.cost = ledger_cost;
             session.partial =
                 totals["costIsPartial"] == true || n(&totals["costMissingCalls"]) > 0.0;
         }
-        if session.tokens.is_none() || (fallback_cost && session.cost.is_some()) {
+        if session.tokens.is_none() || ledger_newer || (fallback_cost && session.cost.is_some()) {
             // On resume Grok can omit cost and send zero process-local tokens.
             // When recovering ledger cost, recover the matching ledger tokens too.
-            session.tokens = number(&totals["totalTokens"])
-                .or_else(|| sum_fields(totals, &["inputTokens", "outputTokens"]))
-                .or(session.tokens);
+            session.tokens = ledger_tokens.or(session.tokens);
         }
         break;
     }
@@ -104,6 +115,20 @@ pub fn tokens(value: Option<f64>) -> String {
         }
     }
     format!("{value:.0}")
+}
+fn live_money(value: Option<f64>, estimated: bool) -> String {
+    if estimated && let Some(value) = value {
+        format!("≈${value:.4}")
+    } else {
+        money(value)
+    }
+}
+fn live_tokens(value: Option<f64>, estimated: bool) -> String {
+    if estimated && let Some(value) = value {
+        format!("≈{value:.0}")
+    } else {
+        tokens(value)
+    }
 }
 pub fn width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
@@ -140,11 +165,16 @@ pub fn status_text(
     // usage bar and percent. Colors are injected after layout, so padding and clipping
     // only measure visible text.
     let sep = " · ";
-    let session_money = money(session.cost);
-    let session_tokens = tokens(session.tokens);
+    let session_money = live_money(session.cost, session.cost_estimated);
+    let session_tokens = live_tokens(session.tokens, session.tokens_estimated);
     let current = format!(
-        "会话 {session_money}{}{sep}{session_tokens} Token",
+        "会话 {session_money}{}{sep}{session_tokens} Token{}",
         if session.partial { "*" } else { "" },
+        if session.generating {
+            " · 生成中"
+        } else {
+            ""
+        },
     );
     let mut spent_money = String::new();
     let mut spent_tokens = String::new();
@@ -175,8 +205,11 @@ pub fn status_text(
         let incomplete = ["unreadable_files", "undated_turns", "partial_cost_turns"]
             .iter()
             .any(|key| n(&usage[*key]) > 0.0);
-        spent_money = money(number(&usage["cost_usd"]));
-        spent_tokens = tokens(number(&usage["totalTokens"]));
+        spent_money = live_money(number(&usage["cost_usd"]), usage["cost_estimated"] == true);
+        spent_tokens = live_tokens(
+            number(&usage["totalTokens"]),
+            usage["tokens_estimated"] == true,
+        );
         let spent_base = format!(
             "已用 {spent_money}{}{sep}{spent_tokens} Token",
             if incomplete { "*" } else { "" },

@@ -119,14 +119,14 @@ $launcherText = '@echo off' + "`r`n" + '"' + $runtimeExe + '" --statusline' + "`
 [IO.File]::WriteAllText($launcher, $launcherText, $utf8)
 $existingConfig = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { '' }
 $commandValue = ConvertTo-Json -InputObject $launcher -Compress
-$block = '[ui.status_line]' + "`n" + 'type = "command"' + "`n" + 'command = ' + $commandValue + "`n" + 'refresh_interval = 2' + "`n"
+$block = '[ui.status_line]' + "`n" + 'type = "command"' + "`n" + 'command = ' + $commandValue + "`n" + 'refresh_interval = 1' + "`n"
 $pattern = '(?ms)^\[ui\.status_line\][^\n]*\n.*?(?=^\[|\z)'
 if ([regex]::IsMatch($existingConfig, $pattern)) {
     $updated = [regex]::Replace($existingConfig, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $block + "`n" })
 } else { $updated = $existingConfig.TrimEnd() + "`n`n" + $block }
 if ($updated -ne $existingConfig) { [IO.File]::WriteAllText($configPath, $updated, $utf8) }
 Write-Host "Installed native runtime: $runtimeExe"
-Write-Host "Monitor task: $taskName; restart Grok to apply the 2-second display timer and new hooks."
+Write-Host "Monitor task: $taskName; restart Grok to apply the 1-second display timer and new hooks."
 Write-Host "Rollback files: $backup"
 & $installedExe
 if ($LASTEXITCODE -ne 0) { Write-Warning "Installed successfully; quota query unavailable. Run: & '$installedExe' --refresh" }

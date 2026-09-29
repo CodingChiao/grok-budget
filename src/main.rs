@@ -111,7 +111,10 @@ fn run(args: &Args) -> Result<()> {
             let _ = storage::refresh_local_cached(&home, &dir, report, grok_budget::now());
         }
         if args.statusline {
-            let session = display::session_usage(&home, &payload);
+            let mut session = display::session_usage(&home, &payload);
+            if !args.offline {
+                grok_budget::live::apply(&home, &payload, &mut session, result.as_mut().ok());
+            }
             let columns = env::var("COLUMNS")
                 .ok()
                 .and_then(|v| v.parse().ok())

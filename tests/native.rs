@@ -264,7 +264,7 @@ fn session_cost_fallback_matches_exact_session() {
         tmp.path(),
         &json!({"session_id":"active","cost":{"total_cost_usd":0},"context_window":{"session_input_tokens":1100,"session_output_tokens":150}}),
     );
-    assert_eq!(explicit.cost, Some(0.0));
+    assert_eq!(explicit.cost, Some(0.25));
     let missing = session_usage(tmp.path(), &json!({"session_id":"unknown"}));
     assert!(missing.cost.is_none());
     let traversal = session_usage(tmp.path(), &json!({"session_id":"../active"}));
@@ -283,6 +283,41 @@ fn resumed_session_uses_matching_ledger_cost_and_tokens() {
     );
     assert_eq!(session.cost, Some(0.25));
     assert_eq!(session.tokens, Some(1250.0));
+}
+
+#[test]
+fn session_timer_reads_new_ledger_with_unchanged_complete_payload() {
+    let tmp = TempDir::new().unwrap();
+    let path = ledger(tmp.path(), "active", vec![turn()]);
+    let payload = json!({"session_id":"active", "trigger":"refresh_interval",
+        "cost":{"total_cost_usd":0.25},
+        "context_window":{"session_input_tokens":1100,"session_output_tokens":150}});
+    assert_eq!(session_usage(tmp.path(), &payload).tokens, Some(1250.0));
+    let mut contents = read_json(&path).unwrap();
+    contents["session"]["totalTokens"] = json!(2500);
+    contents["session"]["costUsdTicks"] = json!(5_000_000_000u64);
+    fs::write(&path, contents.to_string()).unwrap();
+    let updated = session_usage(tmp.path(), &payload);
+    assert_eq!(updated.tokens, Some(2500.0));
+    assert_eq!(updated.cost, Some(0.5));
+
+    // A fresh client payload can precede the ledger write; do not roll it back.
+    let newer = json!({"session_id":"active", "cost":{"total_cost_usd":0.75},
+        "context_window":{"session_input_tokens":3000,"session_output_tokens":750}});
+    assert_eq!(session_usage(tmp.path(), &newer).tokens, Some(3750.0));
+    assert_eq!(session_usage(tmp.path(), &newer).cost, Some(0.75));
+    let mut unpriced = newer;
+    unpriced.as_object_mut().unwrap().remove("cost");
+    assert_eq!(session_usage(tmp.path(), &unpriced).tokens, Some(3750.0));
+    assert!(session_usage(tmp.path(), &unpriced).cost.is_none());
+
+    // New unpriced usage must not retain an old amount as if it priced the new total.
+    contents["session"]
+        .as_object_mut()
+        .unwrap()
+        .remove("costUsdTicks");
+    fs::write(&path, contents.to_string()).unwrap();
+    assert!(session_usage(tmp.path(), &payload).cost.is_none());
 }
 
 #[test]
@@ -357,6 +392,7 @@ fn session_remains_when_account_quota_unavailable() {
         cost: Some(0.85),
         tokens: Some(3_721_843.0),
         partial: false,
+        ..Session::default()
     };
     let line = status_text(None, &session, 80, true);
     let first = line.lines().next().unwrap();
@@ -372,6 +408,7 @@ fn zero_value_spans_color_cleanly() {
         cost: None,
         tokens: Some(0.0),
         partial: false,
+        ..Session::default()
     };
     let line = status_text(None, &session, 80, true);
     assert_eq!(
@@ -382,6 +419,7 @@ fn zero_value_spans_color_cleanly() {
         cost: Some(0.53),
         tokens: Some(10_450_000.0),
         partial: false,
+        ..Session::default()
     };
     let line = status_text(None, &session, 80, true);
     assert_eq!(
@@ -397,6 +435,7 @@ fn layout_never_dims_stretches_or_drops_session_money() {
         cost: Some(0.85),
         tokens: Some(3_721_843.0),
         partial: false,
+        ..Session::default()
     };
     for w in [36, 60, 80, 120, 220] {
         let line = status_text(Some(&r), &session, w, true);
@@ -477,6 +516,7 @@ fn colors_do_not_cross_cells_or_steal_usage_warning() {
                 cost: Some(0.5),
                 tokens: Some(t),
                 partial: false,
+                ..Session::default()
             };
             for w in [36, 60, 80, 120] {
                 let text = status_text(Some(&r), &session, w, true);
@@ -500,6 +540,7 @@ fn colors_do_not_cross_cells_or_steal_usage_warning() {
             cost: Some(0.5),
             tokens: Some(1.0),
             partial: true,
+            ..Session::default()
         };
         assert_eq!(
             strip_ansi(&status_text(Some(&r), &session, w, true)),
