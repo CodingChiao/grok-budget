@@ -337,7 +337,7 @@ fn strip_ansi(s: &str) -> String {
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            while let Some(c2) = chars.next() {
+            for c2 in chars.by_ref() {
                 if c2 == 'm' {
                     break;
                 }
@@ -453,12 +453,7 @@ fn statusline_colors_default_on_and_no_color_disables() {
         }
         let mut child = cmd.spawn().unwrap();
         use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(payload)
-            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(payload).unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
         String::from_utf8(out.stdout).unwrap()
@@ -470,4 +465,292 @@ fn statusline_colors_default_on_and_no_color_disables() {
     assert!(!plain.contains('\u{1b}'), "{plain:?}");
     assert!(plain.contains("会话 $0.53 · 120 Token"), "{plain}");
     assert_eq!(strip_ansi(&colored), plain);
+}
+
+#[test]
+fn colors_do_not_cross_cells_or_steal_usage_warning() {
+    for t in [0.0, 1.0, 9.0, 96.0, 12000.0] {
+        for pct in [0.0, 80.0, 96.0] {
+            let mut r = snapshot(pct, 1.54, at());
+            r["estimate"] = json!({"available":true,"usd":51.19});
+            let session = Session {
+                cost: Some(0.5),
+                tokens: Some(t),
+                partial: false,
+            };
+            for w in [36, 60, 80, 120] {
+                let text = status_text(Some(&r), &session, w, true);
+                assert!(text.contains("\x1b[35m12K\x1b[0m"), "{text:?}");
+                let code = if pct >= 95.0 {
+                    31
+                } else if pct >= 80.0 {
+                    33
+                } else {
+                    32
+                };
+                let expected = format!("\x1b[{code}m");
+                assert!(text.contains(&expected), "{text:?}");
+                assert_eq!(strip_ansi(&text), status_text(Some(&r), &session, w, false));
+            }
+        }
+    }
+    for w in 1..130 {
+        let r = snapshot(96.0, 1.54, at());
+        let session = Session {
+            cost: Some(0.5),
+            tokens: Some(1.0),
+            partial: true,
+        };
+        assert_eq!(
+            strip_ansi(&status_text(Some(&r), &session, w, true)),
+            status_text(Some(&r), &session, w, false)
+        );
+    }
+}
+
+#[test]
+fn exhaustion_uses_total_account_usage_including_chat() {
+    let mut current = snapshot(95.0, 5.0, at());
+    current["quota"]["products"] =
+        json!([{"product":"GrokBuild","used_percent":5},{"product":"GrokChat","used_percent":90}]);
+    let mut old = snapshot(94.0, 4.0, at() - 3600.0);
+    old["quota"]["products"] =
+        json!([{"product":"GrokBuild","used_percent":4},{"product":"GrokChat","used_percent":90}]);
+    let prediction = extrapolate(&current, &[old]);
+    assert_eq!(prediction["hours_to_full"], 5.0);
+    assert_eq!(prediction["basis"], "账户总占比");
+}
+
+#[test]
+fn active_polling_has_jitter_tolerance_then_returns_to_idle() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    signal_at(tmp.path(), &dir, Some("start"), true, at()).unwrap();
+    collect_at(tmp.path(), &dir, Options::default(), at(), |_| {
+        normalize_billing(&billing(1.0))
+    })
+    .unwrap();
+    let r = collect_at(tmp.path(), &dir, Options::default(), at() + 9.9, |_| {
+        normalize_billing(&billing(2.0))
+    })
+    .unwrap();
+    assert_eq!(r["sampled_at"], at() + 9.9);
+    collect_at(tmp.path(), &dir, Options::default(), at() + 70.0, |_| {
+        normalize_billing(&billing(3.0))
+    })
+    .unwrap();
+    let r = collect_at(tmp.path(), &dir, Options::default(), at() + 80.0, |_| {
+        panic!("idle must use cache")
+    })
+    .unwrap();
+    assert_eq!(r["sampled_at"], at() + 70.0);
+    let r = collect_at(tmp.path(), &dir, Options::default(), at() + 129.9, |_| {
+        normalize_billing(&billing(4.0))
+    })
+    .unwrap();
+    assert_eq!(r["sampled_at"], at() + 129.9);
+}
+
+#[test]
+fn stop_delays_sampling_and_rechecks_unchanged_quota_once() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    collect_at(tmp.path(), &dir, Options::default(), at(), |_| {
+        normalize_billing(&billing(1.0))
+    })
+    .unwrap();
+    signal_at(tmp.path(), &dir, Some("stop"), true, at() + 6.0).unwrap();
+    collect_at(tmp.path(), &dir, Options::default(), at() + 7.0, |_| {
+        panic!("wait for billing settlement")
+    })
+    .unwrap();
+    let r = collect_at(tmp.path(), &dir, Options::default(), at() + 8.0, |_| {
+        normalize_billing(&billing(1.0))
+    })
+    .unwrap();
+    assert_eq!(r["sampled_at"], at() + 8.0);
+    let r = collect_at(tmp.path(), &dir, Options::default(), at() + 18.0, |_| {
+        normalize_billing(&billing(2.0))
+    })
+    .unwrap();
+    assert_eq!(r["quota"]["used_percent"], 2.0);
+    let db = connect(&dir).unwrap();
+    let follow: f64 = db
+        .query_row("SELECT follow_due FROM refresh_schedule", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(follow, 0.0);
+}
+
+#[test]
+fn force_still_merges_an_inflight_request_and_does_not_hold_write_lock() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    collect_at(tmp.path(), &dir, Options::default(), at(), |_| {
+        normalize_billing(&billing(1.0))
+    })
+    .unwrap();
+    let r = collect_at(
+        tmp.path(),
+        &dir,
+        Options {
+            force: true,
+            ..Default::default()
+        },
+        at() + 1.0,
+        |_| {
+            let other = collect_at(
+                tmp.path(),
+                &dir,
+                Options {
+                    force: true,
+                    ..Default::default()
+                },
+                at() + 2.0,
+                |_| panic!("duplicate HTTP"),
+            )
+            .unwrap();
+            assert_eq!(other["sampled_at"], at());
+            normalize_billing(&billing(2.0))
+        },
+    )
+    .unwrap();
+    assert_eq!(r["quota"]["used_percent"], 2.0);
+}
+
+#[test]
+fn failures_back_off_and_manual_refresh_respects_retry_after() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    collect_at(tmp.path(), &dir, Options::default(), at(), |_| {
+        normalize_billing(&billing(1.0))
+    })
+    .unwrap();
+    collect_at(tmp.path(), &dir, Options::default(), at() + 60.0, |_| {
+        anyhow::bail!("network unavailable")
+    })
+    .unwrap();
+    collect_at(tmp.path(), &dir, Options::default(), at() + 65.0, |_| {
+        panic!("retry too early")
+    })
+    .unwrap();
+    collect_at(tmp.path(), &dir, Options::default(), at() + 70.0, |_| {
+        anyhow::bail!("network unavailable")
+    })
+    .unwrap();
+    collect_at(tmp.path(), &dir, Options::default(), at() + 89.0, |_| {
+        panic!("second failure must wait 20 seconds")
+    })
+    .unwrap();
+    collect_at(
+        tmp.path(),
+        &dir,
+        Options {
+            force: true,
+            ..Default::default()
+        },
+        at() + 89.0,
+        |_| {
+            Err(BillingFailure {
+                message: "rate limited",
+                retry_seconds: 120.0,
+                rate_limited: true,
+            }
+            .into())
+        },
+    )
+    .unwrap();
+    collect_at(
+        tmp.path(),
+        &dir,
+        Options {
+            force: true,
+            ..Default::default()
+        },
+        at() + 100.0,
+        |_| panic!("force cannot bypass server Retry-After"),
+    )
+    .unwrap();
+    let r = collect_at(tmp.path(), &dir, Options::default(), at() + 209.0, |_| {
+        normalize_billing(&billing(2.0))
+    })
+    .unwrap();
+    assert_eq!(r["stale"], false);
+    assert_eq!(retry_after(Some("120"), at()), 120.0);
+    assert_eq!(
+        retry_after(Some("Tue, 29 Sep 2026 02:02:00 GMT"), at()),
+        120.0
+    );
+    assert_eq!(retry_after(Some("garbage"), at()), 60.0);
+}
+
+#[test]
+fn local_cache_invalidates_on_ledger_change_without_changing_samples() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    let path = ledger(tmp.path(), "a", vec![turn()]);
+    let mut r = collect_at(tmp.path(), &dir, Options::default(), at(), |_| {
+        normalize_billing(&billing(1.0))
+    })
+    .unwrap();
+    let mut contents = read_json(&path).unwrap();
+    let mut next = turn();
+    next["endedAt"] = json!(iso(at() + 0.1));
+    contents["turns"].as_array_mut().unwrap().push(next);
+    fs::write(path, contents.to_string()).unwrap();
+    refresh_local_cached(tmp.path(), &dir, &mut r, at() + 0.2).unwrap();
+    assert_eq!(r["live_local"]["totalTokens"], 220.0);
+    assert_eq!(r["local"]["totalTokens"], 110.0);
+    let old = collect_at(
+        tmp.path(),
+        &dir,
+        Options {
+            offline: true,
+            ..Default::default()
+        },
+        at() + 0.3,
+        |_| panic!(),
+    )
+    .unwrap();
+    assert!(old["live_local"].is_null());
+    assert_eq!(old["local"]["totalTokens"], 110.0);
+}
+
+#[test]
+fn offline_hook_does_not_signal_background_network_requests() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_grok-budget"))
+        .args(["--hook", "--event", "stop", "--offline", "--grok-home"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!tmp.path().join("grok-budget/history.sqlite3").exists());
+}
+
+#[test]
+fn account_period_rollover_is_not_delayed_by_idle_cache() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    let end = timestamp(&json!(END)).unwrap();
+    collect_at(tmp.path(), &dir, Options::default(), end - 10.0, |_| {
+        normalize_billing(&billing(95.0))
+    })
+    .unwrap();
+    let r = collect_at(tmp.path(), &dir, Options::default(), end + 0.1, |_| {
+        let mut b = billing(0.0);
+        b["config"]["currentPeriod"]["start"] = json!(END);
+        b["config"]["currentPeriod"]["end"] = json!("2026-10-12T16:08:48+00:00");
+        normalize_billing(&b)
+    })
+    .unwrap();
+    assert_eq!(r["quota"]["used_percent"], 0.0);
+    assert_eq!(r["stale"], false);
 }

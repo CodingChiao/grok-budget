@@ -30,6 +30,10 @@ struct Args {
     statusline: bool,
     #[arg(long)]
     hook: bool,
+    #[arg(long, value_parser = ["start", "stop"])]
+    event: Option<String>,
+    #[arg(long, hide = true)]
+    daemon: bool,
     #[arg(long)]
     watch: Option<u64>,
     #[arg(long)]
@@ -41,8 +45,8 @@ fn color_enabled(args: &Args) -> bool {
     !args.no_color && env::var_os("NO_COLOR").is_none()
 }
 fn run(args: &Args) -> Result<()> {
-    if args.watch.is_some_and(|v| v < 60) {
-        bail!("--watch 必须至少为 60 秒");
+    if args.watch.is_some_and(|v| v < 5) {
+        bail!("--watch 必须至少为 5 秒");
     }
     let home = args
         .grok_home
@@ -57,6 +61,23 @@ fn run(args: &Args) -> Result<()> {
         .data_dir
         .clone()
         .unwrap_or_else(|| home.join("grok-budget"));
+    if args.daemon {
+        if args.offline {
+            return Ok(());
+        }
+        return storage::run_monitor(&home, &dir);
+    }
+    if args.hook {
+        if args.offline {
+            return Ok(());
+        }
+        return storage::request_background(
+            &home,
+            &dir,
+            args.event.as_deref().or(Some("stop")),
+            true,
+        );
+    }
     let payload = if args.statusline {
         let mut input = String::new();
         io::stdin().take(1_048_576).read_to_string(&mut input)?;
@@ -65,17 +86,29 @@ fn run(args: &Args) -> Result<()> {
         Value::Null
     };
     loop {
+        if args.statusline && !args.offline {
+            let active = payload["prompt_id"].is_string() || payload["trigger"] == "state";
+            let _ = storage::request_background(
+                &home,
+                &dir,
+                if args.refresh { Some("start") } else { None },
+                active,
+            );
+        }
+        if args.watch.is_some() && !args.offline {
+            storage::signal_at(&home, &dir, None, true, grok_budget::now())?;
+        }
         let opts = storage::Options {
             force: args.refresh,
             offline: args.offline,
-            cache_only: args.statusline && payload["trigger"] != "refresh_interval",
+            cache_only: args.statusline,
         };
         let mut result = storage::collect(&home, &dir, opts);
         if !args.offline
             && !args.hook
             && let Ok(report) = result.as_mut()
         {
-            storage::refresh_local(&home, report, grok_budget::now())?;
+            let _ = storage::refresh_local_cached(&home, &dir, report, grok_budget::now());
         }
         if args.statusline {
             let session = display::session_usage(&home, &payload);
@@ -85,12 +118,7 @@ fn run(args: &Args) -> Result<()> {
                 .unwrap_or(80);
             println!(
                 "{}",
-                display::status_text(
-                    result.as_ref().ok(),
-                    &session,
-                    columns,
-                    color_enabled(args)
-                )
+                display::status_text(result.as_ref().ok(), &session, columns, color_enabled(args))
             );
         } else {
             let report = result?;
@@ -117,7 +145,7 @@ fn run(args: &Args) -> Result<()> {
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(&args) {
-        if args.hook {
+        if args.hook || args.daemon {
             return;
         }
         if args.statusline {

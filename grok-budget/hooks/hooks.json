@@ -1,6 +1,26 @@
 {
   "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "& \"$env:GROK_PLUGIN_ROOT/grok-budget.exe\" --hook", "timeout": 8}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "& \"$env:GROK_PLUGIN_ROOT/grok-budget.exe\" --hook", "timeout": 8}]}]
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "& \"$env:GROK_PLUGIN_ROOT/grok-budget.exe\" --hook --event start",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "& \"$env:GROK_PLUGIN_ROOT/grok-budget.exe\" --hook --event stop",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
   }
 }

@@ -29,7 +29,37 @@ pub fn normalize_billing(data: &Value) -> Result<Value> {
     )
 }
 
+#[derive(Debug)]
+pub struct BillingFailure {
+    pub message: &'static str,
+    pub retry_seconds: f64,
+    pub rate_limited: bool,
+}
+impl std::fmt::Display for BillingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+impl std::error::Error for BillingFailure {}
+pub fn retry_after(value: Option<&str>, at: f64) -> f64 {
+    value
+        .and_then(|v| {
+            v.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .or_else(|| {
+                    DateTime::parse_from_rfc2822(v)
+                        .ok()
+                        .map(|d| d.timestamp() as f64 - at)
+                })
+        })
+        .unwrap_or(60.0)
+        .max(5.0)
+}
+
 pub fn fetch_billing(key: &str) -> Result<Value> {
+    let started = std::time::Instant::now();
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -50,7 +80,26 @@ pub fn fetch_billing(key: &str) -> Result<Value> {
         bail!("额度接口发生重定向，已停止请求。");
     }
     if matches!(status.as_u16(), 401 | 403) {
-        bail!("Grok 登录已失效或无权访问额度，请打开 Grok 刷新登录。");
+        return Err(BillingFailure {
+            message: "Grok 登录已失效或无权访问额度，请打开 Grok 刷新登录。",
+            retry_seconds: 300.0,
+            rate_limited: false,
+        }
+        .into());
+    }
+    if status.as_u16() == 429 {
+        return Err(BillingFailure {
+            message: "额度接口限流，已按 Retry-After 延后查询。",
+            rate_limited: true,
+            retry_seconds: retry_after(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok()),
+                now(),
+            ) + started.elapsed().as_secs_f64(),
+        }
+        .into());
     }
     if !status.is_success() {
         bail!("额度接口暂不可用（HTTP {}）。", status.as_u16());
@@ -291,7 +340,7 @@ pub fn duration(seconds: f64) -> String {
 }
 pub fn extrapolate(current: &Value, history: &[Value]) -> Value {
     let q = &current["quota"];
-    let (pct, basis) = estimate_percentage(q);
+    let (pct, basis) = (number(&q["used_percent"]), "账户总占比");
     if !s(&q["period_type"]).contains("WEEKLY") {
         return unavailable("当前不是周周期，不外推耗尽时间。");
     }
@@ -304,7 +353,7 @@ pub fn extrapolate(current: &Value, history: &[Value]) -> Value {
         if !same_period(current, old) {
             continue;
         }
-        let (op, obasis) = estimate_percentage(&old["quota"]);
+        let (op, obasis) = (number(&old["quota"]["used_percent"]), "账户总占比");
         let Some((op, oc)) = op.zip(number(&old["local"]["cost_usd"])) else {
             break;
         };

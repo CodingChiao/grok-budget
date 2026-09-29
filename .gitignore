@@ -5,3 +5,12 @@ output/
 test-results/
 target/
 grok-budget/*.exe
+
+# Release assets and local credentials/data never belong in source control.
+*.zip.sha256
+.env
+.env.*
+!.env.example
+auth.json
+.grok/
+backups/

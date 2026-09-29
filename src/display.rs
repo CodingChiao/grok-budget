@@ -181,23 +181,22 @@ pub fn status_text(
             "已用 {spent_money}{}{sep}{spent_tokens} Token",
             if incomplete { "*" } else { "" },
         );
-        limit_money = format!(
-            "{}{}",
-            if limit.is_some() { "≈" } else { "" },
-            money(limit)
-        );
+        limit_money = format!("{}{}", if limit.is_some() { "≈" } else { "" }, money(limit));
         weekly_tokens = format!(
             "{}{}",
             if token_limit.is_some() { "≈" } else { "" },
             tokens(token_limit)
         );
         let weekly = format!("周限 {limit_money}{sep}{weekly_tokens} Token");
-        let reset = format!(
+        let mut reset = format!(
             "重置 {}{}{}",
             local_date(&r["quota"]["period_end"], "%m-%d %H:%M"),
             if r["stale"] == true { sep } else { "" },
             if r["stale"] == true { "旧数据" } else { "" }
         );
+        if let Some(age) = number(&r["cache_age_seconds"]) {
+            reset.push_str(&format!("{sep}更新于 {}秒前", age as u64));
+        }
         // Try the two-row grid with the usage bar, then without it, then fall back to
         // clipped single cells. A bounded gutter keeps the columns close at every width.
         let mut laid_out = String::new();
@@ -239,54 +238,76 @@ pub fn status_text(
     if !color {
         return output;
     }
-    // 36 cyan for money, 35 magenta for token counts. Placeholder "--" stays plain.
-    // Coloring must scan each plain line left-to-right in one pass: post-hoc replace
-    // can hit digits inside escape codes already inserted (e.g. the "0" in \x1b[0m).
-    let spans: [(&str, &str, u8); 6] = [
-        ("会话", &session_money, 36),
-        ("会话", &session_tokens, 35),
-        ("已用", &spent_money, 36),
-        ("已用", &spent_tokens, 35),
-        ("周限", &limit_money, 36),
-        ("周限", &weekly_tokens, 35),
+    // Locate fields inside their own cells, never search numeric values across a row.
+    let fields = [
+        ("会话", session_money.as_str(), session_tokens.as_str()),
+        ("已用", spent_money.as_str(), spent_tokens.as_str()),
+        ("周限", limit_money.as_str(), weekly_tokens.as_str()),
     ];
-    let mut painted = String::with_capacity(output.len() + 96);
-    for (n, line) in output.lines().enumerate() {
-        if n > 0 {
+    let mut painted = String::new();
+    for (row, line) in output.lines().enumerate() {
+        if row > 0 {
             painted.push('\n');
         }
-        let active: Vec<(&str, u8)> = spans
-            .iter()
-            .filter(|(label, span, code)| {
-                !span.is_empty()
-                    && !(*code == 35 && span.trim_start_matches('≈') == "--")
-                    && line.contains(label)
-            })
-            .map(|(_, span, code)| (*span, *code))
-            .collect();
+        let mut ranges = Vec::new();
+        for (label, amount, count) in fields {
+            let Some(cell) = line.find(label) else {
+                continue;
+            };
+            let start = cell + label.len() + 1;
+            if line
+                .get(start..)
+                .is_some_and(|tail| tail.starts_with(amount))
+                && !amount.is_empty()
+            {
+                ranges.push((start, start + amount.len(), 36));
+            }
+            let partial_mark = line
+                .get(start + amount.len()..)
+                .is_some_and(|tail| tail.starts_with('*'));
+            let token_start = start + amount.len() + usize::from(partial_mark) + sep.len();
+            if !count.is_empty()
+                && count.trim_start_matches('≈') != "--"
+                && line
+                    .get(token_start..)
+                    .is_some_and(|tail| tail.starts_with(count))
+            {
+                ranges.push((token_start, token_start + count.len(), 35));
+            }
+            if label == "已用"
+                && let Some(u) = used
+            {
+                let span = match (&bar, bar_in_spent) {
+                    (Some(b), true) => format!("{b} {pct}"),
+                    _ => pct.clone(),
+                };
+                let usage_start = token_start + count.len() + " Token".len() + sep.len();
+                if line
+                    .get(usage_start..)
+                    .is_some_and(|tail| tail.starts_with(&span))
+                {
+                    ranges.push((
+                        usage_start,
+                        usage_start + span.len(),
+                        if u >= 95.0 {
+                            31
+                        } else if u >= 80.0 {
+                            33
+                        } else {
+                            32
+                        },
+                    ));
+                }
+            }
+        }
+        ranges.sort_unstable_by_key(|r| r.0);
         let mut cursor = 0;
-        while let Some((pos, span, code)) = active
-            .iter()
-            .filter_map(|&(span, code)| {
-                line[cursor..]
-                    .find(span)
-                    .map(|rel| (cursor + rel, span, code))
-            })
-            .min_by_key(|&(pos, _, _)| pos)
-        {
-            painted.push_str(&line[cursor..pos]);
-            painted.push_str(&format!("\x1b[{code}m{span}\x1b[0m"));
-            cursor = pos + span.len();
+        for (start, end, code) in ranges {
+            painted.push_str(&line[cursor..start]);
+            painted.push_str(&format!("\x1b[{code}m{}\x1b[0m", &line[start..end]));
+            cursor = end;
         }
         painted.push_str(&line[cursor..]);
-    }
-    if let Some(u) = used {
-        let code = if u >= 95.0 { 31 } else if u >= 80.0 { 33 } else { 32 };
-        let span = match (&bar, bar_in_spent) {
-            (Some(b), true) => format!("{b} {pct}"),
-            _ => pct.clone(),
-        };
-        painted = painted.replacen(&span, &format!("\x1b[{code}m{span}\x1b[0m"), 1);
     }
     painted
 }
