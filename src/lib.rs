@@ -4,7 +4,7 @@ pub mod live;
 pub mod storage;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde_json::Value;
 use std::{fs, path::Path};
 
@@ -32,9 +32,14 @@ pub fn s(v: &Value) -> &str {
 pub fn now() -> f64 {
     Utc::now().timestamp_millis() as f64 / 1000.0
 }
+pub fn parse_time(v: &Value) -> Result<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(s(v)).context("日期格式无效或缺少时区")
+}
+pub fn seconds(d: &DateTime<FixedOffset>) -> f64 {
+    d.timestamp() as f64 + d.timestamp_subsec_nanos() as f64 / 1e9
+}
 pub fn timestamp(v: &Value) -> Result<f64> {
-    let d = DateTime::parse_from_rfc3339(s(v)).context("日期格式无效或缺少时区")?;
-    Ok(d.timestamp() as f64 + d.timestamp_subsec_nanos() as f64 / 1e9)
+    Ok(seconds(&parse_time(v)?))
 }
 pub fn iso(t: f64) -> String {
     DateTime::from_timestamp_millis((t * 1000.0) as i64)
@@ -64,16 +69,30 @@ pub fn credentials(home: &Path) -> Result<(String, String)> {
         bail!("未找到唯一的 Grok 登录项，请运行 grok login 确认账户。");
     }
     let entry = entries[0];
-    let identity = if !entry["user_id"].is_null() {
-        &entry["user_id"]
-    } else {
-        &entry["principal_id"]
-    };
-    if identity.is_null() || s(identity).is_empty() {
-        bail!("登录项缺少账户标识。");
-    }
+    let identity = ["user_id", "principal_id"]
+        .into_iter()
+        .map(|k| s(&entry[k]))
+        .find(|v| !v.is_empty())
+        .context("登录项缺少账户标识。")?;
     Ok((
         s(&entry["key"]).into(),
-        format!("{:x}", Sha256::digest(s(identity).as_bytes()))[..24].into(),
+        format!("{:x}", Sha256::digest(identity.as_bytes()))[..24].into(),
     ))
+}
+
+/// Locate the session directory `sessions/<workspace>/<id>` for a status payload.
+/// The id must be a plain identifier so it can never escape the sessions tree.
+pub fn session_dir(home: &Path, id: &str) -> Option<std::path::PathBuf> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    fs::read_dir(home.join("sessions"))
+        .ok()?
+        .flatten()
+        .map(|ws| ws.path().join(id))
+        .find(|dir| dir.is_dir())
 }

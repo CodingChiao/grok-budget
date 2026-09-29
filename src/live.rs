@@ -6,7 +6,6 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::PathBuf,
 };
 
 const MAX_TAIL: u64 = 16 * 1024 * 1024;
@@ -42,44 +41,19 @@ fn rate_from_settled(settled: &BTreeMap<String, SettledTurn>) -> Option<f64> {
     (tokens > 0.0).then_some(ticks / TICKS / tokens)
 }
 
-fn session_dir(home: &Path, payload: &Value) -> Option<PathBuf> {
-    let id = s(&payload["session_id"]);
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return None;
-    }
-    // Only read the exact session beneath this Grok home; never follow an
-    // arbitrary transcript_path supplied by another process. A timer payload
-    // often omits transcript_path, and usage.json does not exist until the
-    // turn is settled by the next command, so also look the session up by id.
-    let root = home.join("sessions").canonicalize().ok()?;
-    let mut candidates = vec![PathBuf::from(s(&payload["transcript_path"]))];
-    if let Ok(workspaces) = std::fs::read_dir(&root) {
-        for workspace in workspaces.flatten() {
-            candidates.push(workspace.path().join(id).join("updates.jsonl"));
-        }
-    }
-    candidates.extend(
-        data::ledgers(home)
-            .into_iter()
-            .map(|p| p.with_file_name("updates.jsonl")),
-    );
-    for path in candidates {
-        let Ok(path) = path.canonicalize() else {
-            continue;
-        };
-        let parent = path.parent()?;
-        if path.file_name().and_then(|v| v.to_str()) == Some("updates.jsonl")
-            && parent.file_name().and_then(|v| v.to_str()) == Some(id)
-            && parent.parent().and_then(Path::parent) == Some(root.as_path())
-        {
-            return Some(parent.to_path_buf());
-        }
-    }
-    None
+fn price_rate(home: &Path, model: &str, settled: &BTreeMap<String, SettledTurn>) -> Option<f64> {
+    historical_rate(home, model).or_else(|| rate_from_settled(settled))
+}
+
+fn turn_settled_since(ledger: Option<&Value>, start: Option<f64>) -> bool {
+    let (Some(ledger), Some(start)) = (ledger, start) else {
+        return false;
+    };
+    ledger["turns"].as_array().is_some_and(|turns| {
+        turns
+            .iter()
+            .any(|t| timestamp(&t["endedAt"]).is_ok_and(|end| end >= start))
+    })
 }
 
 /// Ledger rows bill `grok-4.7` as `grok-4.7-build`. Accept that suffix, and
@@ -144,7 +118,7 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
     if !requested.is_empty() {
         session.generating = true;
     }
-    let Some(dir) = session_dir(home, payload) else {
+    let Some(dir) = session_dir(home, s(&payload["session_id"])) else {
         return;
     };
     let Ok(mut file) = File::open(dir.join("updates.jsonl")) else {
@@ -203,8 +177,9 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
             seen.clear();
             current_done = false;
             turn_start = number(&payload["turn"]["started_at_ms"]).map(|v| v / 1000.0);
-            first_time = None;
         }
+        // First same-session event in the tail, across prompts: it tells whether
+        // the tail begins before the followed turn, so it must not reset above.
         if first_time.is_none() {
             first_time = time;
         }
@@ -259,31 +234,21 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
     }
     // A tail that starts after this turn, or a missing start, cannot price the
     // open call. Completed usage already in the stream can still be shown.
-    let mut open = !current_done;
-    if open
-        && (turn_start.is_none()
-            || (offset > 0
-                && first_time.is_none_or(|time| turn_start.is_some_and(|start| time > start))))
-    {
-        open = false;
-        calls.clear();
-    }
+    let open = !current_done
+        && match turn_start {
+            None => false,
+            Some(start) => offset == 0 || first_time.is_some_and(|time| time <= start),
+        };
     if !open {
         calls.clear();
     }
     session.generating = open;
-    let ledger = read_json(&dir.join("usage.json"))
+    let ledger_file = dir.join("usage.json");
+    let ledger_exists = ledger_file.exists();
+    let ledger = read_json(&ledger_file)
         .ok()
-        .filter(|ledger| s(&ledger["sessionId"]) == s(&payload["session_id"]));
-    if let Some(start) = turn_start
-        && ledger.as_ref().is_some_and(|ledger| {
-            ledger["turns"].as_array().is_some_and(|turns| {
-                turns
-                    .iter()
-                    .any(|t| timestamp(&t["endedAt"]).is_ok_and(|end| end >= start))
-            })
-        })
-    {
+        .filter(|ledger| ledger["sessionId"] == payload["session_id"]);
+    if turn_settled_since(ledger.as_ref(), turn_start) {
         session.generating = false;
         return;
     }
@@ -302,11 +267,13 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
         if settled.is_empty() || tokens >= settled_tokens {
             (Some(tokens), ledger_cost)
         } else {
-            (Some(settled_tokens), settled_cost.or(ledger_cost))
+            // A larger stream settlement that has no price is not covered by the
+            // older ledger cost. Pairing them would show that cost as exact.
+            (Some(settled_tokens), settled_cost)
         }
     } else if !settled.is_empty() {
         (Some(settled_tokens), settled_cost)
-    } else if !dir.join("usage.json").exists() && offset == 0 {
+    } else if !ledger_exists && offset == 0 {
         (Some(0.0), Some(0.0))
     } else {
         (None, None)
@@ -342,15 +309,22 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
     if payload_ahead && session.cost.is_some() && !stream_newer {
         return;
     }
-    let rate =
-        historical_rate(home, s(&payload["model"]["id"])).or_else(|| rate_from_settled(&settled));
+    let model = s(&payload["model"]["id"]);
     let (open_tokens, open_cost) = if payload_ahead && !stream_newer {
         let gap = (payload_tokens.unwrap_or(0.0) - completed).max(0.0);
-        let priced = match (base_cost, rate) {
-            (Some(base), Some(rate)) => Some(base + rate * gap),
-            (Some(base), None) if gap == 0.0 => Some(base),
-            (None, Some(rate)) => payload_tokens.map(|tokens| rate * tokens),
-            _ => None,
+        let rate = if gap > 0.0 || base_cost.is_none() {
+            price_rate(home, model, &settled)
+        } else {
+            None
+        };
+        let priced = if let Some(base) = base_cost {
+            if gap == 0.0 {
+                Some(base)
+            } else {
+                rate.map(|rate| base + rate * gap)
+            }
+        } else {
+            rate.and_then(|rate| payload_tokens.map(|tokens| rate * tokens))
         };
         let Some(priced) = priced else {
             return;
@@ -359,21 +333,25 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
         session.cost_estimated = gap > 0.0 || base_cost.is_none();
         (gap, rate.filter(|_| gap > 0.0).map(|rate| rate * gap))
     } else {
-        let open_cost = if delta > 0.0 {
-            rate.map(|value| value * delta)
+        let rate = if delta > 0.0 {
+            price_rate(home, model, &settled)
         } else {
             None
         };
+        let open_cost = rate.map(|value| value * delta);
         session.tokens = Some(completed + delta);
-        session.tokens_estimated = delta > 0.0 && session.tokens.is_some();
+        session.tokens_estimated = delta > 0.0;
         if delta > 0.0 {
             // No price for the open call means the total would omit that spend.
             session.cost = base_cost.zip(open_cost).map(|(base, extra)| base + extra);
             session.cost_estimated = session.cost.is_some();
         } else if let Some(cost) = base_cost
-            && (session.cost.is_none() || session.cost.is_some_and(|current| current + 1e-9 < cost))
+            && session.cost.is_none_or(|current| current + 1e-9 < cost)
         {
             session.cost = Some(cost);
+            session.cost_estimated = false;
+        } else if base_cost.is_none() && payload_tokens.is_some_and(|tokens| tokens != completed) {
+            session.cost = None;
             session.cost_estimated = false;
         }
         (delta, open_cost)
@@ -417,27 +395,10 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
     if extra_tokens <= 0.0 && extra_cost.unwrap_or(0.0) <= 0.0 {
         return;
     }
-    // Re-read completed local totals after the stream scan, so the overlay
-    // never stacks on a stale local-cache baseline. Recheck settlement to
-    // avoid double counting a turn that ended during this status run.
-    let usage = data::local_usage(home, period_start, now());
-    if turn_start.is_some_and(|start| {
-        read_json(&dir.join("usage.json"))
-            .ok()
-            .is_some_and(|ledger| {
-                ledger["turns"].as_array().is_some_and(|turns| {
-                    turns
-                        .iter()
-                        .any(|t| timestamp(&t["endedAt"]).is_ok_and(|end| end >= start))
-                })
-            })
-    }) {
-        *session = crate::display::session_usage(home, payload);
-        report["live_local"] = usage;
-        return;
-    }
-    report["live_local"] = usage;
-    let usage = &mut report["live_local"];
+    // The caller already refreshed live_local from the ledgers (fingerprinted,
+    // so any settled turn invalidates it). Overlay on that baseline: a turn that
+    // settles after the check above is not in it yet, so nothing double counts.
+    let mut usage = crate::display::display_usage(report).clone();
     usage["totalTokens"] = json!(n(&usage["totalTokens"]) + extra_tokens);
     usage["tokens_estimated"] = json!(open_tokens > 0.0 && !payload_ahead);
     match extra_cost {
@@ -450,4 +411,5 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
             usage["cost_estimated"] = json!(false);
         }
     }
+    report["live_local"] = usage;
 }

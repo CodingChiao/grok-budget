@@ -159,13 +159,11 @@ pub fn local_usage(home: &Path, start: f64, end: f64) -> Value {
             }
         };
         for turn in ledger["turns"].as_array().unwrap() {
-            let ended = match timestamp(&turn["endedAt"]) {
-                Ok(v) => v,
-                Err(_) => {
-                    add(&mut u, "undated_turns", 1.0);
-                    continue;
-                }
+            let Ok(ended_at) = parse_time(&turn["endedAt"]) else {
+                add(&mut u, "undated_turns", 1.0);
+                continue;
             };
+            let ended = seconds(&ended_at);
             if ended < start || ended >= end {
                 continue;
             }
@@ -200,32 +198,27 @@ pub fn local_usage(home: &Path, start: f64, end: f64) -> Value {
             for f in FIELDS {
                 add(&mut u, f, n(&turn[f]));
             }
-            let day = DateTime::parse_from_rfc3339(s(&turn["endedAt"]))
-                .unwrap()
+            let day = ended_at
                 .with_timezone(&Local)
                 .format("%Y-%m-%d")
                 .to_string();
             add(&mut u["daily"], &day, n(&turn["costUsdTicks"]) / TICKS);
-            let models = turn["modelUsage"]
-                .as_object()
-                .filter(|m| !m.is_empty())
-                .cloned()
-                .unwrap_or_else(|| {
-                    Map::from_iter([(
-                        turn["primaryModelId"].as_str().unwrap_or("unknown").into(),
-                        turn.clone(),
-                    )])
-                });
+            // Per-model rows come from modelUsage; a ledger without one bills the
+            // whole turn to its primary model.
+            let models: Vec<(&str, &Value)> = match turn["modelUsage"].as_object() {
+                Some(m) if !m.is_empty() => m.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+                _ => vec![(turn["primaryModelId"].as_str().unwrap_or("unknown"), turn)],
+            };
             for (model, values) in models {
                 if !values.is_object() {
                     continue;
                 }
-                if u["models"][&model].is_null() {
-                    u["models"][&model] = json!({"cost_usd":0,"input_tokens":0,"cached_tokens":0,"output_tokens":0,"calls":0,"partial":false});
+                if u["models"][model].is_null() {
+                    u["models"][model] = json!({"cost_usd":0,"input_tokens":0,"cached_tokens":0,"output_tokens":0,"calls":0,"partial":false});
                 }
-                let row = &mut u["models"][&model];
+                let row = &mut u["models"][model];
                 add(row, "cost_usd", n(&values["costUsdTicks"]) / TICKS);
-                row["partial"] = json!(row["partial"] == true || partial(&values));
+                row["partial"] = json!(row["partial"] == true || partial(values));
                 for (source, dest) in [
                     ("inputTokens", "input_tokens"),
                     ("cachedReadTokens", "cached_tokens"),
@@ -303,7 +296,10 @@ pub fn estimate(current: &Value, history: &[Value]) -> Value {
         let Some(op) = op else {
             break;
         };
-        let oc = n(&old["local"]["cost_usd"]);
+        // A missing cost is not zero. Treating it as zero invents a delta.
+        let Some(oc) = number(&old["local"]["cost_usd"]) else {
+            break;
+        };
         if obasis != basis || op > last_pct || oc > last_cost {
             break;
         }
@@ -340,11 +336,11 @@ pub fn duration(seconds: f64) -> String {
 }
 pub fn extrapolate(current: &Value, history: &[Value]) -> Value {
     let q = &current["quota"];
-    let (pct, basis) = (number(&q["used_percent"]), "账户总占比");
+    let basis = "账户总占比";
     if !s(&q["period_type"]).contains("WEEKLY") {
         return unavailable("当前不是周周期，不外推耗尽时间。");
     }
-    let Some(pct) = pct.filter(|p| *p > 0.0 && *p < 100.0 && n(&q["used_percent"]) < 100.0) else {
+    let Some(pct) = number(&q["used_percent"]).filter(|p| *p > 0.0 && *p < 100.0) else {
         return unavailable("占比缺失、为零或已封顶，不外推耗尽时间。");
     };
     let (mut last_pct, mut last_cost) = (pct, n(&current["local"]["cost_usd"]));
@@ -353,11 +349,12 @@ pub fn extrapolate(current: &Value, history: &[Value]) -> Value {
         if !same_period(current, old) {
             continue;
         }
-        let (op, obasis) = (number(&old["quota"]["used_percent"]), "账户总占比");
-        let Some((op, oc)) = op.zip(number(&old["local"]["cost_usd"])) else {
+        let Some((op, oc)) =
+            number(&old["quota"]["used_percent"]).zip(number(&old["local"]["cost_usd"]))
+        else {
             break;
         };
-        if obasis != basis || op > last_pct || oc > last_cost {
+        if op > last_pct || oc > last_cost {
             break;
         }
         anchor = Some((op, n(&old["sampled_at"])));

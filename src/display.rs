@@ -40,56 +40,35 @@ pub fn session_usage(home: &Path, payload: &Value) -> Session {
         partial: false,
         ..Session::default()
     };
-    let id = s(&payload["session_id"]);
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    {
-        return session;
-    }
     // Match the exact session; never guess from the newest ledger or read chat logs.
-    for path in data::ledgers(home) {
-        if path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|v| v.to_str())
-            != Some(id)
-        {
-            continue;
-        }
-        let Ok(ledger) = read_json(&path) else {
-            continue;
-        };
-        if s(&ledger["sessionId"]) != id {
-            continue;
-        }
-        let totals = &ledger["session"];
-        let ledger_cost = number(&totals["costUsdTicks"]).map(|v| v / TICKS);
-        let ledger_tokens = number(&totals["totalTokens"])
-            .or_else(|| sum_fields(totals, &["inputTokens", "outputTokens"]));
-        // Timer runs reuse Grok's last payload. Re-read the matching ledger even
-        // when that payload is complete, and advance the paired totals together.
-        let ledger_newer = ledger_tokens.zip(session.tokens).is_some_and(|(l, p)| {
-            l > p || (l == p && ledger_cost.zip(session.cost).is_some_and(|(l, p)| l > p))
-        });
-        let fallback_cost = session.cost.is_none()
-            && !session
-                .tokens
-                .zip(ledger_tokens)
-                .is_some_and(|(p, l)| p > l);
-        if fallback_cost || ledger_newer {
-            session.cost = ledger_cost;
-            session.partial =
-                totals["costIsPartial"] == true || n(&totals["costMissingCalls"]) > 0.0;
-        }
-        if session.tokens.is_none() || ledger_newer || (fallback_cost && session.cost.is_some()) {
-            // On resume Grok can omit cost and send zero process-local tokens.
-            // When recovering ledger cost, recover the matching ledger tokens too.
-            session.tokens = ledger_tokens.or(session.tokens);
-        }
-        break;
+    let Some(ledger) = session_dir(home, s(&payload["session_id"]))
+        .and_then(|dir| read_json(&dir.join("usage.json")).ok())
+        .filter(|ledger| ledger["sessionId"] == payload["session_id"])
+    else {
+        return session;
+    };
+    let totals = &ledger["session"];
+    let ledger_cost = number(&totals["costUsdTicks"]).map(|v| v / TICKS);
+    let ledger_tokens = number(&totals["totalTokens"])
+        .or_else(|| sum_fields(totals, &["inputTokens", "outputTokens"]));
+    // Timer runs reuse Grok's last payload. Re-read the matching ledger even
+    // when that payload is complete, and advance the paired totals together.
+    let ledger_newer = ledger_tokens.zip(session.tokens).is_some_and(|(l, p)| {
+        l > p || (l == p && ledger_cost.zip(session.cost).is_some_and(|(l, p)| l > p))
+    });
+    let fallback_cost = session.cost.is_none()
+        && !session
+            .tokens
+            .zip(ledger_tokens)
+            .is_some_and(|(p, l)| p > l);
+    if fallback_cost || ledger_newer {
+        session.cost = ledger_cost;
+        session.partial = totals["costIsPartial"] == true || n(&totals["costMissingCalls"]) > 0.0;
+    }
+    if session.tokens.is_none() || ledger_newer || (fallback_cost && session.cost.is_some()) {
+        // On resume Grok can omit cost and send zero process-local tokens.
+        // When recovering ledger cost, recover the matching ledger tokens too.
+        session.tokens = ledger_tokens.or(session.tokens);
     }
     session
 }

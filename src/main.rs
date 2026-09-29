@@ -105,7 +105,6 @@ fn run(args: &Args) -> Result<()> {
         };
         let mut result = storage::collect(&home, &dir, opts);
         if !args.offline
-            && !args.hook
             && let Ok(report) = result.as_mut()
         {
             let _ = storage::refresh_local_cached(&home, &dir, report, grok_budget::now());
@@ -128,16 +127,14 @@ fn run(args: &Args) -> Result<()> {
             if let Some(path) = &args.html {
                 display::write_html(&report, path)?;
             }
-            if !args.hook {
-                println!(
-                    "{}",
-                    if args.json {
-                        serde_json::to_string_pretty(&report)?
-                    } else {
-                        display::report_text(&report)
-                    }
-                );
-            }
+            println!(
+                "{}",
+                if args.json {
+                    serde_json::to_string_pretty(&report)?
+                } else {
+                    display::report_text(&report)
+                }
+            );
         }
         match args.watch {
             Some(seconds) => thread::sleep(Duration::from_secs(seconds)),

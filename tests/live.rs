@@ -58,12 +58,21 @@ impl Fixture {
     fn render(&self) -> (Session, Value) {
         let mut session = session_usage(self.home.path(), &self.payload);
         let mut report = self.report.clone();
+        // Mirror main.rs: the caller refreshes live_local from the ledgers before
+        // the stream overlay runs, so apply() never re-parses them itself.
+        let start = timestamp(&report["quota"]["period_start"]).unwrap();
+        let baseline = grok_budget::data::local_usage(self.home.path(), start, now());
+        report["live_local"] = baseline.clone();
         live::apply(
             self.home.path(),
             &self.payload,
             &mut session,
             Some(&mut report),
         );
+        // Keep `live_local.is_null()` meaning "no live overlay was applied".
+        if report["live_local"] == baseline {
+            report["live_local"] = Value::Null;
+        }
         (session, report)
     }
 }
@@ -418,4 +427,69 @@ fn unreadable_existing_ledger_is_not_treated_as_a_new_session() {
     assert_eq!(s.tokens, Some(1000.0));
     assert!(!s.tokens_estimated);
     assert!(r["live_local"].is_null());
+}
+
+#[test]
+fn long_stream_tail_still_prices_an_open_turn_it_fully_covers() {
+    // Only the last 16 MiB of updates.jsonl is read. When that tail begins
+    // before the followed turn started, every chunk of the turn is visible and
+    // the open call can be priced. A timer payload carries no prompt id, so the
+    // prompt is discovered from the stream; that switch must not forget where
+    // the tail began, or every long session would show settled values only.
+    let mut f = Fixture::new();
+    f.payload.as_object_mut().unwrap().remove("prompt_id");
+    f.payload["trigger"] = json!("refresh_interval");
+    let mut previous = f.chunk("p", 1, "earlier turn");
+    previous["timestamp"] = json!(f.start - 5.0);
+    previous["params"]["_meta"]["promptId"] = json!("previous");
+    previous["params"]["_meta"]["turnStartMs"] = json!((f.start - 6.0) * 1000.0);
+    let filler = format!("{previous}\n");
+    let mut padding = String::with_capacity(17 * 1024 * 1024);
+    while padding.len() < 17 * 1024 * 1024 {
+        padding.push_str(&filler);
+    }
+    fs::write(&f.stream, padding).unwrap();
+    f.append(
+        &json!({"timestamp":f.start-4.0,"params":{"sessionId":"active",
+        "update":{"sessionUpdate":"turn_completed","prompt_id":"previous",
+            "usage":{"totalTokens":1000,"costUsdTicks":1_000_000_000u64}}}}),
+    );
+    f.append(&f.chunk("a", 1, "abcdefgh"));
+    let (s, r) = f.render();
+    assert!(s.generating, "tail covers the whole turn");
+    assert_eq!(s.tokens, Some(1102.0));
+    assert!(s.tokens_estimated);
+    assert_eq!(r["live_local"]["totalTokens"], 1102.0);
+
+    // A tail that begins after the turn started may have lost chunks: settled only.
+    let mut late = f.chunk("late", 1, "same turn, earlier chunk lost");
+    late["timestamp"] = json!(f.start + 0.5);
+    let filler = format!("{late}\n");
+    let mut padding = String::with_capacity(17 * 1024 * 1024);
+    while padding.len() < 17 * 1024 * 1024 {
+        padding.push_str(&filler);
+    }
+    fs::write(&f.stream, padding).unwrap();
+    f.append(&f.chunk("b", 1, "abcdefgh"));
+    let (s, _) = f.render();
+    assert!(!s.generating);
+    assert!(!s.tokens_estimated);
+    assert_eq!(s.tokens, Some(1000.0));
+}
+
+#[test]
+fn newer_unpriced_settlement_does_not_keep_the_old_cost() {
+    let f = Fixture::new();
+    f.append(
+        &json!({"timestamp":f.start+1.0,"params":{"sessionId":"active",
+        "update":{"sessionUpdate":"turn_completed","prompt_id":"prompt",
+            "usage":{"totalTokens":1500}}}}),
+    );
+    let (s, _) = f.render();
+    assert_eq!(s.tokens, Some(1500.0));
+    assert!(
+        s.cost.is_none(),
+        "old ledger cost must not price the new total"
+    );
+    assert!(!s.cost_estimated && !s.tokens_estimated && !s.generating);
 }

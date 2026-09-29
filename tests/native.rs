@@ -165,8 +165,16 @@ fn storage_reuses_cache_and_does_not_hold_network_lock() {
     })
     .unwrap();
     assert_eq!(r["sampled_at"], r2["sampled_at"]);
-    let raw = fs::read(dir.join("history.sqlite3")).unwrap();
+    // With WAL, recent rows may still sit in the -wal file until a checkpoint.
+    let mut raw = fs::read(dir.join("history.sqlite3")).unwrap();
+    if let Ok(wal) = fs::read(dir.join("history.sqlite3-wal")) {
+        raw.extend(wal);
+    }
     let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.contains("snapshots"),
+        "database content must be scanned"
+    );
     assert!(!text.contains("SECRET_TOKEN"));
     assert!(!text.contains("a-user"));
     auth(tmp.path(), "other-user");
@@ -336,7 +344,7 @@ fn cumulative_tokens_refresh_without_waiting_for_quota_or_mutating_samples() {
     let mut contents = read_json(&path).unwrap();
     contents["turns"].as_array_mut().unwrap().push(next);
     fs::write(path, contents.to_string()).unwrap();
-    refresh_local(tmp.path(), &mut report, at() + 2.0).unwrap();
+    refresh_local_cached(tmp.path(), &dir, &mut report, at() + 2.0).unwrap();
     assert_eq!(display_usage(&report)["totalTokens"], 220.0);
     assert_eq!(display_usage(&report)["cost_usd"], 0.2);
     assert_eq!(report["local"]["totalTokens"], 110.0);
@@ -794,4 +802,68 @@ fn account_period_rollover_is_not_delayed_by_idle_cache() {
     .unwrap();
     assert_eq!(r["quota"]["used_percent"], 0.0);
     assert_eq!(r["stale"], false);
+}
+
+#[test]
+fn missing_history_cost_is_not_treated_as_zero() {
+    let current = snapshot(10.0, 5.0, at());
+    let mut old = snapshot(2.0, 1.0, at() - 1000.0);
+    old["local"].as_object_mut().unwrap().remove("cost_usd");
+    let estimate = estimate(&current, &[old]);
+    assert_eq!(estimate["method"], "period");
+    assert_eq!(estimate["usd"], 50.0);
+}
+
+#[test]
+fn damaged_snapshot_does_not_hide_the_last_good_sample_or_block_sampling() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    collect_at(tmp.path(), &dir, Options::default(), at(), |_| {
+        normalize_billing(&billing(4.0))
+    })
+    .unwrap();
+    let (_, account) = credentials(tmp.path()).unwrap();
+    let db = connect(&dir).unwrap();
+    db.execute(
+        "INSERT INTO snapshots(account,sampled,payload) VALUES (?,?,?)",
+        rusqlite::params![account, at() + 1.0, "{"],
+    )
+    .unwrap();
+    drop(db);
+    let cached = collect_at(
+        tmp.path(),
+        &dir,
+        Options {
+            offline: true,
+            ..Default::default()
+        },
+        at() + 2.0,
+        |_| panic!(),
+    )
+    .unwrap();
+    assert_eq!(cached["quota"]["used_percent"], 4.0);
+    let fresh = collect_at(tmp.path(), &dir, Options::default(), at() + 120.0, |_| {
+        normalize_billing(&billing(8.0))
+    })
+    .unwrap();
+    assert_eq!(fresh["quota"]["used_percent"], 8.0);
+    assert_eq!(fresh["stale"], false);
+}
+
+#[test]
+fn stored_sampling_error_does_not_keep_the_cause_chain() {
+    let tmp = TempDir::new().unwrap();
+    auth(tmp.path(), "a");
+    let dir = tmp.path().join("data");
+    collect_at(tmp.path(), &dir, Options::default(), at(), |_| {
+        normalize_billing(&billing(1.0))
+    })
+    .unwrap();
+    let r = collect_at(tmp.path(), &dir, Options::default(), at() + 120.0, |_| {
+        Err(anyhow::anyhow!("SECRET_BODY").context("额度响应不是有效 JSON"))
+    })
+    .unwrap();
+    assert_eq!(r["error"], "额度响应不是有效 JSON");
+    assert!(!r["error"].as_str().unwrap().contains("SECRET_BODY"));
 }
