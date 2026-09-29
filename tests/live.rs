@@ -155,6 +155,54 @@ fn idle_newer_payload_and_previous_prompt_are_not_double_counted() {
 }
 
 #[test]
+fn payload_tokens_ahead_of_the_stream_keep_a_priced_session_cost() {
+    let mut f = Fixture::new();
+    fs::remove_file(&f.ledger).unwrap();
+    f.payload.as_object_mut().unwrap().remove("cost");
+    f.payload["context_window"]["session_input_tokens"] = json!(1500);
+    f.payload["context_window"]["session_output_tokens"] = json!(0);
+    f.append(&json!({"timestamp":f.start,"params":{"sessionId":"active",
+        "_meta":{"agentTimestampMs":f.start*1000.0},
+        "update":{"sessionUpdate":"turn_completed","prompt_id":"previous",
+            "usage":{"totalTokens":1000,"costUsdTicks":1_000_000_000u64}}}}));
+    f.append(&f.chunk("a", 1, "abcdefgh"));
+    let (s, r) = f.render();
+    assert_eq!(s.tokens, Some(1500.0));
+    assert!(!s.tokens_estimated);
+    assert!((s.cost.unwrap() - 0.15).abs() < 1e-8);
+    assert!(s.cost_estimated && s.generating);
+    assert_eq!(r["live_local"]["totalTokens"], 1500.0);
+    assert!((r["live_local"]["cost_usd"].as_f64().unwrap() - 0.15).abs() < 1e-8);
+    assert_eq!(r["live_local"]["tokens_estimated"], false);
+    assert_eq!(r["live_local"]["cost_estimated"], true);
+
+    f.payload["cost"]["total_cost_usd"] = json!(0.2);
+    let (s, r) = f.render();
+    assert_eq!(s.tokens, Some(1500.0));
+    assert_eq!(s.cost, Some(0.2));
+    assert!(!s.cost_estimated);
+    assert!(r["live_local"].is_null());
+}
+
+#[test]
+fn ahead_payload_without_a_rate_leaves_cost_unknown() {
+    let mut f = Fixture::new();
+    fs::remove_file(&f.ledger).unwrap();
+    f.payload["model"]["id"] = json!("unknown-model");
+    f.payload.as_object_mut().unwrap().remove("cost");
+    f.payload["context_window"]["session_input_tokens"] = json!(1500);
+    f.payload["context_window"]["session_output_tokens"] = json!(0);
+    f.append(&json!({"timestamp":f.start,"params":{"sessionId":"active",
+        "update":{"sessionUpdate":"turn_completed","prompt_id":"previous",
+            "usage":{"totalTokens":1000}}}}));
+    f.append(&f.chunk("a", 1, "abcdefgh"));
+    let (s, r) = f.render();
+    assert_eq!(s.tokens, Some(1500.0));
+    assert!(s.cost.is_none());
+    assert!(r["live_local"].is_null());
+}
+
+#[test]
 fn settled_stream_usage_is_the_base_when_the_ledger_file_is_missing() {
     let mut f = Fixture::new();
     fs::remove_file(&f.ledger).unwrap();

@@ -2,7 +2,7 @@
 
 Grok Build 的非官方额度监测插件。在状态栏中查看账户用量、重置时间、会话成本和 Token，也可以导出中文 HTML 看板。
 
-**Windows x64 · Rust 原生 · 0.2.8 · MIT License**
+**Windows x64 · Rust 原生 · 0.3.0 · MIT License**
 
 [下载最新版](https://github.com/CodingChiao/grok-budget/releases/latest) · [版本记录](https://github.com/CodingChiao/grok-budget/releases) · [反馈问题](https://github.com/CodingChiao/grok-budget/issues)
 
@@ -97,7 +97,7 @@ Start-Process ./output/grok-budget.html
 | 场景 | 行为 |
 | --- | --- |
 | 状态栏显示 | 每 1 秒重新读取本地结果；会话状态变化也会触发更新 |
-| 生成中 | 按当前会话的新流式事件更新会话与本机累计 Token、费用估算，标注 `≈`；账本结算后去掉估算增量。账本文件还没写出时，流里已结束轮次的 `usage` 作为基数 |
+| 生成中 | 按当前会话的新流式事件更新会话与本机累计 Token、费用估算，标注 `≈`；账本结算后去掉估算增量。账本文件还没写出时，流里已结束轮次的 `usage` 作为基数。客户端 Token 已经更高而费用还没到时，保留该 Token 数，并用已结算单价补上会话金额 |
 | 活跃会话 | 账户额度约每 10 秒查询一次 |
 | 空闲会话 | 账户额度约每 60 秒查询一次 |
 | 会话启动 / 恢复 | 提交立即查询信号，受请求合并和最低间隔限制 |

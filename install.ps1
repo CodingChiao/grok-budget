@@ -105,7 +105,10 @@ if (-not (Test-Path -LiteralPath $runtimeExe) -or (Get-FileHash -LiteralPath $ru
 }
 $taskUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $daemonCommand = "& '" + $runtimeExe.Replace("'", "''") + "' --daemon --grok-home '" + $grokHome.Replace("'", "''") + "'"
-$action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -Command "' + $daemonCommand + '"')
+# Avoid nested command-line quotes being reinterpreted by the Windows terminal host.
+# Windows PowerShell requires UTF-16LE for -EncodedCommand.
+$encodedDaemonCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($daemonCommand))
+$action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ' + $encodedDaemonCommand)
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
 $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)

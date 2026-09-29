@@ -292,41 +292,62 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
         .values()
         .map(|c| c.input.unwrap_or(0.0) + (c.output_quarters as f64 / 4.0).ceil())
         .sum();
-    if base_tokens.is_none() || (delta == 0.0 && settled.is_empty() && ledger_tokens.is_none()) {
+    let Some(completed) = base_tokens else {
+        return;
+    };
+    if delta == 0.0 && settled.is_empty() && ledger_tokens.is_none() {
         return;
     }
-    // A newer payload may already include this call. Wait for the ledger rather
-    // than stacking our estimate on top of potentially settled usage.
-    if delta > 0.0 && session.tokens.zip(base_tokens).is_some_and(|(p, b)| p > b) {
-        return;
-    }
-    if delta == 0.0
-        && session
-            .tokens
-            .zip(base_tokens)
-            .is_some_and(|(p, b)| p >= b && p > 0.0)
-    {
+    // A newer payload may already include this call. Keep its token count
+    // instead of stacking a character estimate on top. Cost is often still
+    // absent at that point; price the payload from settled usage.
+    let payload_tokens = session.tokens;
+    let payload_ahead = payload_tokens.is_some_and(|tokens| {
+        if delta > 0.0 {
+            tokens > completed
+        } else {
+            tokens >= completed && tokens > 0.0
+        }
+    });
+    if payload_ahead && session.cost.is_some() {
         return;
     }
     let rate =
         historical_rate(home, s(&payload["model"]["id"])).or_else(|| rate_from_settled(&settled));
-    let cost_delta = if delta > 0.0 {
-        rate.map(|value| value * delta)
+    let (open_tokens, open_cost) = if payload_ahead {
+        let gap = (payload_tokens.unwrap_or(0.0) - completed).max(0.0);
+        let priced = match (base_cost, rate) {
+            (Some(base), Some(rate)) => Some(base + rate * gap),
+            (Some(base), None) if gap == 0.0 => Some(base),
+            (None, Some(rate)) => payload_tokens.map(|tokens| rate * tokens),
+            _ => None,
+        };
+        let Some(priced) = priced else {
+            return;
+        };
+        session.cost = Some(priced);
+        session.cost_estimated = gap > 0.0 || base_cost.is_none();
+        (gap, rate.filter(|_| gap > 0.0).map(|rate| rate * gap))
     } else {
-        None
+        let open_cost = if delta > 0.0 {
+            rate.map(|value| value * delta)
+        } else {
+            None
+        };
+        session.tokens = Some(completed + delta);
+        session.tokens_estimated = delta > 0.0 && session.tokens.is_some();
+        if delta > 0.0 {
+            // No price for the open call means the total would omit that spend.
+            session.cost = base_cost.zip(open_cost).map(|(base, extra)| base + extra);
+            session.cost_estimated = session.cost.is_some();
+        } else if let Some(cost) = base_cost
+            && (session.cost.is_none() || session.cost.is_some_and(|current| current + 1e-9 < cost))
+        {
+            session.cost = Some(cost);
+            session.cost_estimated = false;
+        }
+        (delta, open_cost)
     };
-    session.tokens = base_tokens.map(|value| value + delta);
-    session.tokens_estimated = delta > 0.0 && session.tokens.is_some();
-    if delta > 0.0 {
-        // No price for the open call means the total would omit that spend.
-        session.cost = base_cost.zip(cost_delta).map(|(base, extra)| base + extra);
-        session.cost_estimated = session.cost.is_some();
-    } else if let Some(cost) = base_cost
-        && (session.cost.is_none() || session.cost.is_some_and(|current| current + 1e-9 < cost))
-    {
-        session.cost = Some(cost);
-        session.cost_estimated = false;
-    }
     let Some(report) = report else {
         return;
     };
@@ -354,9 +375,11 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
             }
         }
     }
-    if delta > 0.0 && turn_start.is_some_and(|start| start >= period_start && start < period_end) {
-        extra_tokens += delta;
-        match (extra_cost.as_mut(), cost_delta) {
+    if open_tokens > 0.0
+        && turn_start.is_some_and(|start| start >= period_start && start < period_end)
+    {
+        extra_tokens += open_tokens;
+        match (extra_cost.as_mut(), open_cost) {
             (Some(slot), Some(value)) => *slot += value,
             _ => extra_cost = None,
         }
@@ -386,12 +409,11 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
     report["live_local"] = usage;
     let usage = &mut report["live_local"];
     usage["totalTokens"] = json!(n(&usage["totalTokens"]) + extra_tokens);
-    let estimating = delta > 0.0;
-    usage["tokens_estimated"] = json!(estimating);
+    usage["tokens_estimated"] = json!(open_tokens > 0.0 && !payload_ahead);
     match extra_cost {
         Some(value) => {
             usage["cost_usd"] = json!(n(&usage["cost_usd"]) + value);
-            usage["cost_estimated"] = json!(estimating && cost_delta.is_some());
+            usage["cost_estimated"] = json!(open_cost.is_some() && open_tokens > 0.0);
         }
         None => {
             usage["cost_usd"] = Value::Null;
