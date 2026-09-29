@@ -5,7 +5,9 @@ $root = $PSScriptRoot
 $grokHome = if ($env:GROK_HOME) { $env:GROK_HOME } else { Join-Path $env:USERPROFILE '.grok' }
 $pluginSource = Join-Path $root 'grok-budget'
 $binary = Join-Path $pluginSource 'grok-budget.exe'
+$monitorBinary = Join-Path $pluginSource 'grok-budget-monitor.exe'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
+. (Join-Path $root 'scripts\monitor-task.ps1')
 
 function Invoke-Grok {
     param([string[]]$Arguments)
@@ -13,12 +15,13 @@ function Invoke-Grok {
     if ($LASTEXITCODE -ne 0) { throw "grok failed: $($Arguments -join ' ')" }
 }
 
-if ($Build -or -not (Test-Path -LiteralPath $binary)) {
+if ($Build -or -not (Test-Path -LiteralPath $binary) -or -not (Test-Path -LiteralPath $monitorBinary)) {
     Push-Location $root
     try {
         & cargo build --release --locked
         if ($LASTEXITCODE -ne 0) { throw 'Rust build failed.' }
         Copy-Item -LiteralPath (Join-Path $root 'target\release\grok-budget.exe') -Destination $binary -Force
+        Copy-Item -LiteralPath (Join-Path $root 'target\release\grok-budget-monitor.exe') -Destination $monitorBinary -Force
     } finally { Pop-Location }
 }
 
@@ -80,7 +83,7 @@ if (-not $installed -or $registered.version -ne $expectedVersion) { throw 'Plugi
 
 # Grok's local-plugin update can leave a copied installation stale: publish explicitly.
 if ([IO.Path]::GetFullPath($installed) -ne [IO.Path]::GetFullPath($pluginSource)) {
-    foreach ($relative in @('grok-budget.exe','plugin.json','hooks\hooks.json','commands\budget.md','report.html')) {
+    foreach ($relative in @('grok-budget.exe','grok-budget-monitor.exe','plugin.json','hooks\hooks.json','commands\budget.md','report.html')) {
         $destination = Join-Path $installed $relative
         $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
         $published = $false
@@ -96,29 +99,44 @@ $installedExe = Join-Path $installed 'grok-budget.exe'
 if ($LASTEXITCODE -ne 0) { throw 'Installed Rust binary failed validation.' }
 
 # A versioned independent runtime avoids Grok's child-process cleanup and update locks.
-$runtimeDir = Join-Path $grokHome "grok-budget\runtime\$expectedVersion"
+$runtimeHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.Substring(0,12).ToLowerInvariant() + '-' + (Get-FileHash -LiteralPath $monitorBinary -Algorithm SHA256).Hash.Substring(0,12).ToLowerInvariant()
+$runtimeDir = Join-Path $grokHome "grok-budget\runtime\$expectedVersion-$runtimeHash"
 $null = New-Item -ItemType Directory -Path $runtimeDir -Force
 $runtimeExe = Join-Path $runtimeDir 'grok-budget.exe'
-if ($oldTask) { Stop-ScheduledTask -TaskName $taskName }
+$runtimeMonitor = Join-Path $runtimeDir 'grok-budget-monitor.exe'
 if (-not (Test-Path -LiteralPath $runtimeExe) -or (Get-FileHash -LiteralPath $runtimeExe).Hash -ne (Get-FileHash -LiteralPath $binary).Hash) {
     Copy-Item -LiteralPath $binary -Destination $runtimeExe -Force
 }
-$taskUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$daemonCommand = "& '" + $runtimeExe.Replace("'", "''") + "' --daemon --grok-home '" + $grokHome.Replace("'", "''") + "'"
-# Avoid nested command-line quotes being reinterpreted by the Windows terminal host.
-# Windows PowerShell requires UTF-16LE for -EncodedCommand.
-$encodedDaemonCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($daemonCommand))
-$action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ' + $encodedDaemonCommand)
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
-$principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-$null = Register-ScheduledTask -TaskName $taskName -Description $taskDescription -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
-Start-ScheduledTask -TaskName $taskName
-Start-Sleep -Milliseconds 800
-if ((Get-ScheduledTask -TaskName $taskName).State -ne 'Running') { throw 'Quota monitor did not start. Backups have been preserved.' }
+if (-not (Test-Path -LiteralPath $runtimeMonitor)) {
+    Copy-Item -LiteralPath $monitorBinary -Destination $runtimeMonitor
+}
+$definition = New-GrokBudgetMonitorTask -RuntimeExe $runtimeMonitor -GrokHome $grokHome
+try {
+    if ($oldTask) {
+        # Disable before stopping so an existing watchdog cannot race the update.
+        $null = Disable-ScheduledTask -TaskName $taskName
+        Stop-ScheduledTask -TaskName $taskName
+        $stopDeadline = (Get-Date).AddSeconds(15)
+        while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
+            if ((Get-Date) -ge $stopDeadline) { throw 'Previous quota monitor did not stop.' }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    Stop-GrokBudgetLegacyMonitor -GrokHome $grokHome
+    $null = Register-ScheduledTask -TaskName $taskName -InputObject $definition -Force
+    Start-ScheduledTask -TaskName $taskName
+    Wait-GrokBudgetMonitor -TaskName $taskName
+} catch {
+    if ($oldTask) {
+        $oldXml = [IO.File]::ReadAllText((Join-Path $backup 'monitor-task.xml'))
+        $null = Register-ScheduledTask -TaskName $taskName -Xml $oldXml -Force
+        if ($oldTask.State -ne 'Disabled') { Start-ScheduledTask -TaskName $taskName }
+    }
+    throw
+}
 
 # Keep the existing launcher path, so already-open sessions pick up Rust immediately.
-$launcherText = '@echo off' + "`r`n" + '"' + $runtimeExe + '" --statusline' + "`r`n"
+$launcherText = '@echo off' + "`r`n" + '"' + $runtimeExe + '" --statusline --grok-home "' + $grokHome + '"' + "`r`n"
 [IO.File]::WriteAllText($launcher, $launcherText, $utf8)
 $existingConfig = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { '' }
 $commandValue = ConvertTo-Json -InputObject $launcher -Compress
@@ -129,7 +147,7 @@ if ([regex]::IsMatch($existingConfig, $pattern)) {
 } else { $updated = $existingConfig.TrimEnd() + "`n`n" + $block }
 if ($updated -ne $existingConfig) { [IO.File]::WriteAllText($configPath, $updated, $utf8) }
 Write-Host "Installed native runtime: $runtimeExe"
-Write-Host "Monitor task: $taskName; restart Grok to apply the 1-second display timer and new hooks."
+Write-Host "Monitor task: $taskName; automatic recovery every minute. Restart Grok to reload hooks."
 Write-Host "Rollback files: $backup"
 & $installedExe
 if ($LASTEXITCODE -ne 0) { Write-Warning "Installed successfully; quota query unavailable. Run: & '$installedExe' --refresh" }

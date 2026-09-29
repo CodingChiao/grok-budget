@@ -2,10 +2,13 @@
 param()
 $ErrorActionPreference = 'Stop'
 $grokHome = if ($env:GROK_HOME) { $env:GROK_HOME } else { Join-Path $env:USERPROFILE '.grok' }
+. (Join-Path $PSScriptRoot 'scripts\monitor-task.ps1')
 $task = Get-ScheduledTask -TaskName 'GrokBudgetMonitor' -ErrorAction SilentlyContinue
 if ($task) {
     if ($task.Description -ne 'Grok Budget account quota monitor (managed by grok-budget installer)') { throw 'The task belongs to another application.' }
+    $null = Disable-ScheduledTask -TaskName $task.TaskName
     Stop-ScheduledTask -TaskName $task.TaskName
+    Stop-GrokBudgetLegacyMonitor -GrokHome $grokHome
     Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false
 }
 $configPath = Join-Path $grokHome 'config.toml'

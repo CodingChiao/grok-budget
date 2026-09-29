@@ -2,7 +2,7 @@
 
 Grok Build 的非官方额度监测插件。在状态栏中查看账户用量、重置时间、会话成本和 Token，也可以导出中文 HTML 看板。
 
-**Windows x64 · Rust 原生 · 0.3.0 · MIT License**
+**Windows x64 · Rust 原生 · 0.3.1 · MIT License**
 
 [下载最新版](https://github.com/CodingChiao/grok-budget/releases/latest) · [版本记录](https://github.com/CodingChiao/grok-budget/releases) · [反馈问题](https://github.com/CodingChiao/grok-budget/issues)
 
@@ -34,7 +34,7 @@ Grok Build 的非官方额度监测插件。在状态栏中查看账户用量、
 ./install.ps1
 ```
 
-安装器会注册插件、配置状态栏，并启动当前用户后台任务 `GrokBudgetMonitor`。任务使用普通用户权限、隐藏运行，不保存登录密码。
+安装器会注册插件、配置状态栏，并启动当前用户后台任务 `GrokBudgetMonitor`。任务使用普通用户权限、隐藏运行，不保存登录密码。登录时自动启动；退出或被停止后，每分钟的触发器会自动拉起，运行中的实例不会重复启动。
 
 **安装或更新后，请重新启动 Grok 客户端，让定时配置和 hooks 生效。** 安装器不会主动结束当前会话。
 
@@ -103,6 +103,7 @@ Start-Process ./output/grok-budget.html
 | 会话启动 / 恢复 | 提交立即查询信号，受请求合并和最低间隔限制 |
 | 回答结束 | 提交约 2 秒后的查询；额度信息未变化时，约 10 秒后补查一次 |
 | 无会话信号 | 最后一次状态栏 / hook 信号超过 20 秒后，不再自动访问额度接口 |
+| 后台退出或被停止 | 由 Windows 计划任务在下一个一分钟触发点自动拉起；用户必须处于登录状态，系统须可运行任务 |
 | 手动刷新 | 跳过普通缓存等待，不重复发起进行中的请求，也不绕过服务端限流 |
 
 自动请求至少间隔 5 秒，刚完成的查询可能合并或推迟事件请求。最后一次活跃信号后保留 60 秒活跃窗口；实际显示延迟还受服务端记账和状态栏刷新时机影响。
@@ -166,7 +167,7 @@ Start-Process ./output/grok-budget.html
 ./uninstall.ps1
 ```
 
-卸载脚本会停止并删除本插件的后台任务，移除属于本插件的状态栏配置，再通过 Grok 卸载插件。历史、运行文件和备份保留；重启 Grok 后生效。
+卸载脚本会先禁用触发器，再停止并删除本插件的后台任务，移除属于本插件的状态栏配置，再通过 Grok 卸载插件。历史、运行文件和备份保留；重启 Grok 后生效。
 
 ## 常见问题
 
@@ -180,7 +181,10 @@ Start-Process ./output/grok-budget.html
 
 ```powershell
 Get-ScheduledTask -TaskName GrokBudgetMonitor | Select-Object TaskName, State
+Get-ScheduledTaskInfo -TaskName GrokBudgetMonitor | Select-Object LastRunTime, LastTaskResult
 ```
+
+0.3.1 起，后台停止后通常在一分钟内恢复；`Running` 表示正在运行。需要立即启动可执行 `Start-ScheduledTask -TaskName GrokBudgetMonitor`。如需持续暂停，应先执行 `Disable-ScheduledTask -TaskName GrokBudgetMonitor`，再执行 `Stop-ScheduledTask -TaskName GrokBudgetMonitor`；恢复时执行 `Enable-ScheduledTask` 和 `Start-ScheduledTask`。单独停止任务会被自动拉起。
 
 **为什么金额变了，百分比没变？**
 
@@ -192,21 +196,26 @@ Get-ScheduledTask -TaskName GrokBudgetMonitor | Select-Object TaskName, State
 
 ## 从源码构建
 
-需要 Rust 工具链和 Windows C++ 构建工具。在仓库根目录执行：
+需要 rustup 和 Windows C++ 构建工具。`rust-toolchain.toml` 固定 Rust 1.96.0、rustfmt 和 Clippy。在仓库根目录执行：
 
 ```powershell
-cargo test --release --locked
-cargo clippy --release --locked --all-targets -- -D warnings
-./install.ps1 -Build
+./scripts/build.ps1
+./install.ps1
 ```
 
-仅编译时执行 `cargo build --release --locked`，程序位于 `target/release/grok-budget.exe`。
+构建脚本检查格式、运行 release 测试和 Clippy、检查 PowerShell 语法与计划任务定义，然后生成 ZIP 和 SHA-256。打包时逐文件核对内容，并执行解压后的程序验证版本。仅编译时执行 `cargo build --release --locked`，程序位于 `target/release/grok-budget.exe`。
+
+真实计划任务恢复测试需在已登录的 Windows 用户会话执行 `powershell -NoProfile -ExecutionPolicy Bypass -File tests/monitor-task.ps1 -Integration`。它使用独立任务和无登录凭据的测试目录，验证停止后自动恢复及多次启动只保留一个实例，最后移除测试任务。CI 运行定义、无窗口程序格式与退出码测试；真实恢复测试在本机验收。
+
+GitHub Actions 在推送和 PR 时构建、测试并保存 ZIP；推送与清单版本一致的 `v*` 标签后，仅在全部检查通过时上传 GitHub Release。版本说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 | 路径 | 内容 |
 | --- | --- |
 | `src/` | 额度接口、账本统计、缓存调度和终端显示 |
 | `grok-budget/` | 插件清单、hooks、`/budget` 命令及内嵌看板模板 |
 | `install.ps1` / `uninstall.ps1` | 安装、更新与卸载 |
+| `scripts/` | 计划任务定义、构建检查与发布包生成 |
+| `.github/workflows/build.yml` | Windows CI 与标签发布 |
 | `tests/native.rs` | 数据口径、刷新调度、并发与显示回归测试 |
 
 本仓库只包含 Grok Budget 插件，不包含 Grok Build 本体、账户凭据或使用历史。使用 [MIT License](LICENSE) 发布。

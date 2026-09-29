@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "& \"$env:GROK_PLUGIN_ROOT/grok-budget.exe\" --hook --event start",
+            "command": "& \"${GROK_PLUGIN_ROOT}/grok-budget.exe\" --hook --event start",
             "timeout": 8
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "& \"$env:GROK_PLUGIN_ROOT/grok-budget.exe\" --hook --event stop",
+            "command": "& \"${GROK_PLUGIN_ROOT}/grok-budget.exe\" --hook --event stop",
             "timeout": 8
           }
         ]

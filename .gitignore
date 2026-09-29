@@ -3,6 +3,7 @@ output/
 *.sqlite3*
 *.zip
 test-results/
+artifacts/
 target/
 grok-budget/*.exe
 
