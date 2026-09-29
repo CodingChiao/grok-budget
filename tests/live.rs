@@ -185,6 +185,42 @@ fn payload_tokens_ahead_of_the_stream_keep_a_priced_session_cost() {
 }
 
 #[test]
+fn new_conversation_prices_client_tokens_from_the_billing_model_suffix() {
+    let mut f = Fixture::new();
+    fs::remove_file(&f.ledger).unwrap();
+    let older = f.home.path().join("sessions/workspace/older");
+    fs::create_dir_all(&older).unwrap();
+    let usage = json!({"totalTokens":1000,"costUsdTicks":1_000_000_000u64});
+    fs::write(
+        older.join("usage.json"),
+        json!({"sessionId":"older","turns":[{"endedAt":iso(f.start-3600.0),
+            "totalTokens":1000,"costUsdTicks":1_000_000_000u64,"primaryModelId":"grok-4.7-build",
+            "modelUsage":{"grok-4.7-build":usage}}]})
+        .to_string(),
+    )
+    .unwrap();
+    f.payload["model"]["id"] = json!("grok-4.7");
+    f.payload.as_object_mut().unwrap().remove("cost");
+    f.payload["context_window"]["session_input_tokens"] = json!(1500);
+    f.payload["context_window"]["session_output_tokens"] = json!(0);
+    let (s, r) = f.render();
+    assert_eq!(s.tokens, Some(1500.0));
+    assert!(!s.tokens_estimated);
+    assert!((s.cost.unwrap() - 0.15).abs() < 1e-8, "session cost {}", s.cost.unwrap());
+    assert!(s.cost_estimated && s.generating);
+    assert!((r["live_local"]["cost_usd"].as_f64().unwrap() - 0.25).abs() < 1e-8);
+    assert_eq!(r["live_local"]["totalTokens"], 2500.0);
+    assert_eq!(r["live_local"]["cost_estimated"], true);
+
+    // A shorter id must not inherit a different model's price.
+    f.payload["model"]["id"] = json!("grok-4");
+    let (s, r) = f.render();
+    assert_eq!(s.tokens, Some(1500.0));
+    assert!(s.cost.is_none());
+    assert!(r["live_local"].is_null());
+}
+
+#[test]
 fn ahead_payload_without_a_rate_leaves_cost_unknown() {
     let mut f = Fixture::new();
     fs::remove_file(&f.ledger).unwrap();
@@ -268,6 +304,41 @@ fn new_session_can_estimate_tokens_but_cross_period_overlay_is_rejected() {
     assert!(s.cost.is_none());
     f.report["quota"]["period_start"] = json!(iso(f.start + 1.0));
     assert!(f.render().1["live_local"].is_null());
+}
+
+#[test]
+fn open_turn_shows_without_transcript_path_or_ledger() {
+    let mut f = Fixture::new();
+    fs::remove_file(&f.ledger).unwrap();
+    f.payload.as_object_mut().unwrap().remove("transcript_path");
+    f.payload.as_object_mut().unwrap().remove("prompt_id");
+    f.payload.as_object_mut().unwrap().remove("cost");
+    f.payload["trigger"] = json!("refresh_interval");
+    f.payload["context_window"]["session_input_tokens"] = json!(0);
+    f.payload["context_window"]["session_output_tokens"] = json!(0);
+    f.append(&f.chunk("a", 1, "abcdefgh"));
+    let (s, _) = f.render();
+    assert_eq!(s.tokens, Some(102.0));
+    assert!(s.generating && s.tokens_estimated);
+}
+
+#[test]
+fn refresh_snapshot_does_not_hide_a_larger_open_turn() {
+    let mut f = Fixture::new();
+    fs::remove_file(&f.ledger).unwrap();
+    f.payload.as_object_mut().unwrap().remove("prompt_id");
+    f.payload["trigger"] = json!("refresh_interval");
+    f.payload["cost"]["total_cost_usd"] = json!(0.12);
+    f.payload["context_window"]["session_input_tokens"] = json!(1050);
+    f.payload["context_window"]["session_output_tokens"] = json!(0);
+    f.append(&json!({"timestamp":f.start,"params":{"sessionId":"active",
+        "_meta":{"agentTimestampMs":f.start*1000.0},
+        "update":{"sessionUpdate":"turn_completed","prompt_id":"previous",
+            "usage":{"totalTokens":1000,"costUsdTicks":1_000_000_000u64}}}}));
+    f.append(&f.chunk("a", 1, "abcdefgh"));
+    let (s, _) = f.render();
+    assert_eq!(s.tokens, Some(1102.0));
+    assert!(s.generating && s.tokens_estimated);
 }
 
 #[test]

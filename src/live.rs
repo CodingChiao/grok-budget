@@ -52,10 +52,17 @@ fn session_dir(home: &Path, payload: &Value) -> Option<PathBuf> {
         return None;
     }
     // Only read the exact session beneath this Grok home; never follow an
-    // arbitrary transcript_path supplied by another process.
+    // arbitrary transcript_path supplied by another process. A timer payload
+    // often omits transcript_path, and usage.json does not exist until the
+    // turn is settled by the next command, so also look the session up by id.
     let root = home.join("sessions").canonicalize().ok()?;
-    let supplied = PathBuf::from(s(&payload["transcript_path"]));
-    let candidates = std::iter::once(supplied).chain(
+    let mut candidates = vec![PathBuf::from(s(&payload["transcript_path"]))];
+    if let Ok(workspaces) = std::fs::read_dir(&root) {
+        for workspace in workspaces.flatten() {
+            candidates.push(workspace.path().join(id).join("updates.jsonl"));
+        }
+    }
+    candidates.extend(
         data::ledgers(home)
             .into_iter()
             .map(|p| p.with_file_name("updates.jsonl")),
@@ -75,6 +82,15 @@ fn session_dir(home: &Path, payload: &Value) -> Option<PathBuf> {
     None
 }
 
+/// Ledger rows bill `grok-4.7` as `grok-4.7-build`. Accept that suffix, and
+/// nothing broader: `grok-4` must not pick up `grok-4.7-build`.
+fn same_billed_model(key: &str, model: &str) -> bool {
+    key == model
+        || key
+            .strip_prefix(model)
+            .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
+}
+
 /// Effective same-model USD/token rate from the latest 20 completed, priced
 /// model records. It includes the historical cache mix, so it is an estimate,
 /// never a provider price. Unknown model/rate stays unknown.
@@ -91,17 +107,24 @@ fn historical_rate(home: &Path, model: &str) -> Option<f64> {
             continue;
         };
         for turn in turns {
-            let usage = &turn["modelUsage"][model];
-            if usage["costIsPartial"] == true || n(&usage["costMissingCalls"]) > 0.0 {
+            let Some(models) = turn["modelUsage"].as_object() else {
                 continue;
-            }
-            if let (Ok(ended), Some(cost), Some(tokens)) = (
-                timestamp(&turn["endedAt"]),
-                number(&usage["costUsdTicks"]),
-                number(&usage["totalTokens"]),
-            ) && tokens > 0.0
-            {
-                samples.push((ended, cost / TICKS, tokens));
+            };
+            for (key, usage) in models {
+                if !same_billed_model(key, model)
+                    || usage["costIsPartial"] == true
+                    || n(&usage["costMissingCalls"]) > 0.0
+                {
+                    continue;
+                }
+                if let (Ok(ended), Some(cost), Some(tokens)) = (
+                    timestamp(&turn["endedAt"]),
+                    number(&usage["costUsdTicks"]),
+                    number(&usage["totalTokens"]),
+                ) && tokens > 0.0
+                {
+                    samples.push((ended, cost / TICKS, tokens));
+                }
             }
         }
     }
@@ -295,12 +318,11 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
     let Some(completed) = base_tokens else {
         return;
     };
-    if delta == 0.0 && settled.is_empty() && ledger_tokens.is_none() {
-        return;
-    }
     // A newer payload may already include this call. Keep its token count
     // instead of stacking a character estimate on top. Cost is often still
-    // absent at that point; price the payload from settled usage.
+    // absent at that point; price the payload from settled usage. A new
+    // conversation has neither a ledger nor stream text yet, but the client
+    // token count is already ahead and still needs a price.
     let payload_tokens = session.tokens;
     let payload_ahead = payload_tokens.is_some_and(|tokens| {
         if delta > 0.0 {
@@ -309,12 +331,20 @@ pub fn apply(home: &Path, payload: &Value, session: &mut Session, report: Option
             tokens >= completed && tokens > 0.0
         }
     });
-    if payload_ahead && session.cost.is_some() {
+    if delta == 0.0 && settled.is_empty() && ledger_tokens.is_none() && !payload_ahead {
+        return;
+    }
+    // refresh_interval replays the last state snapshot until the next command.
+    // A priced snapshot must not hide an open turn that has since grown.
+    let stream_total = completed + delta;
+    let stream_newer = s(&payload["trigger"]) == "refresh_interval"
+        && stream_total > payload_tokens.unwrap_or(0.0);
+    if payload_ahead && session.cost.is_some() && !stream_newer {
         return;
     }
     let rate =
         historical_rate(home, s(&payload["model"]["id"])).or_else(|| rate_from_settled(&settled));
-    let (open_tokens, open_cost) = if payload_ahead {
+    let (open_tokens, open_cost) = if payload_ahead && !stream_newer {
         let gap = (payload_tokens.unwrap_or(0.0) - completed).max(0.0);
         let priced = match (base_cost, rate) {
             (Some(base), Some(rate)) => Some(base + rate * gap),
