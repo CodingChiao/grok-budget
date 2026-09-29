@@ -206,7 +206,11 @@ fn new_conversation_prices_client_tokens_from_the_billing_model_suffix() {
     let (s, r) = f.render();
     assert_eq!(s.tokens, Some(1500.0));
     assert!(!s.tokens_estimated);
-    assert!((s.cost.unwrap() - 0.15).abs() < 1e-8, "session cost {}", s.cost.unwrap());
+    assert!(
+        (s.cost.unwrap() - 0.15).abs() < 1e-8,
+        "session cost {}",
+        s.cost.unwrap()
+    );
     assert!(s.cost_estimated && s.generating);
     assert!((r["live_local"]["cost_usd"].as_f64().unwrap() - 0.25).abs() < 1e-8);
     assert_eq!(r["live_local"]["totalTokens"], 2500.0);
