@@ -2,7 +2,7 @@
 
 Grok Build 的非官方额度监测插件。在状态栏中查看账户用量、重置时间、会话成本和 Token，也可以导出中文 HTML 看板。
 
-**Windows x64 · Rust 原生 · 0.3.1 · MIT License**
+**Windows x64 · Rust 原生 · 0.3.2 · MIT License**
 
 [下载最新版](https://github.com/CodingChiao/grok-budget/releases/latest) · [版本记录](https://github.com/CodingChiao/grok-budget/releases) · [反馈问题](https://github.com/CodingChiao/grok-budget/issues)
 
