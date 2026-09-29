@@ -129,4 +129,4 @@ Write-Host "Installed native runtime: $runtimeExe"
 Write-Host "Monitor task: $taskName; restart Grok to apply the 2-second display timer and new hooks."
 Write-Host "Rollback files: $backup"
 & $installedExe
-if ($LASTEXITCODE -ne 0) { Write-Warning 'Installed successfully; quota query unavailable. Run grok-budget.cmd later.' }
+if ($LASTEXITCODE -ne 0) { Write-Warning "Installed successfully; quota query unavailable. Run: & '$installedExe' --refresh" }

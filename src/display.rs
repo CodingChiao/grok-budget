@@ -232,7 +232,7 @@ pub fn status_text(
         output = format!(
             "{}\n{}",
             clip(&current, columns),
-            clip("额度暂不可用  请运行 grok-budget.cmd", columns)
+            clip("额度暂不可用  请运行 grok-budget.exe --refresh", columns)
         );
     }
     if !color {

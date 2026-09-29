@@ -1,6 +1,6 @@
 [package]
 name = "grok-budget"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 description = "Native Grok Build allowance monitor and status line"
 license = "MIT"

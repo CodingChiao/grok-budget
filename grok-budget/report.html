@@ -363,7 +363,7 @@ footer .wrap{display:flex;flex-direction:column;gap:2px}
       <li>估算假设本机覆盖本周期全部消耗、模型成本与额度按固定比例变化；其他设备、Grok Chat、旧账户账本、未结束的调用、计费延迟与动态折扣都会带来偏差。</li>
       <li>单次百分比误差按 ±1 个百分点做敏感性分析；敏感区间不是统计置信区间，反推周限不是官方上限。</li>
       <li>官方美元与 Token 周上限接口未公开，本看板全部数值均为本地推算。</li>
-      <li>本页是静态快照。重新运行 <code>看板.cmd</code> 生成最新版本；持续记录可运行 <code>grok-budget.cmd --watch 60</code>。</li>
+      <li>本页是静态快照。在分发包目录运行 <code>./grok-budget/grok-budget.exe --html output/grok-budget.html</code> 生成最新版本；持续记录可使用 <code>--watch 10</code>。</li>
     </ul>
     <div class="actions">
       <button id="export" class="btn primary">

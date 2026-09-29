@@ -149,7 +149,7 @@ fn main() {
             return;
         }
         if args.statusline {
-            println!("额度暂不可用  请运行 grok-budget.cmd");
+            println!("额度暂不可用  请运行 grok-budget.exe --refresh");
             return;
         }
         eprintln!("Grok Budget: {e}");

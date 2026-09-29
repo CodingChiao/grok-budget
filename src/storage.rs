@@ -82,7 +82,7 @@ where
         let error = attempt(&db, &account)?.and_then(|a| a.1);
         return previous
             .map(|r| annotate(r, error.as_deref(), at))
-            .context("还没有额度缓存，请先运行 grok-budget.cmd。");
+            .context("还没有额度缓存，请先运行 grok-budget.exe --refresh。");
     }
     // Reserve the attempt under a short lock; neither HTTP nor ledger I/O holds it.
     let reserve = (|| -> Result<Option<Value>> {
